@@ -1,0 +1,236 @@
+// Copyright (c) ONNX Project Contributors
+// Licensed under the MIT license
+
+syntax = "proto2";
+
+package onnx;
+
+// Overview:
+//
+// ONNX files are organized as a proto message with a ModelProto at the root.
+// The ModelProto contains metadata about the model, a description of the graph,
+// and the initial values for all parameters.
+//
+// Each computation in the graph is represented as a Node. The Node message defines the
+// computation, the inputs, outputs, and attributes for the node.
+
+// Note: This is a simplified version of the ONNX proto file for demonstration purposes.
+// A real implementation would use the official ONNX proto files from:
+// https://github.com/onnx/onnx/blob/main/onnx/onnx.proto
+
+// ModelProto is the top-level file/container format for ONNX.
+message ModelProto {
+  // The version of the IR this model uses.
+  optional int64 ir_version = 1;
+  
+  // The name of the framework or tool used to generate this model.
+  optional string producer_name = 2;
+  
+  // The version of the framework or tool used to generate this model.
+  optional string producer_version = 3;
+  
+  // Domain name of the model (default is empty).
+  optional string domain = 4;
+  
+  // Model version
+  optional int64 model_version = 5;
+  
+  // Human-readable documentation for this model.
+  optional string doc_string = 6;
+  
+  // The main graph that contains all the operators.
+  optional GraphProto graph = 7;
+  
+  // A collection of operator sets imported for this model.
+  repeated OperatorSetIdProto opset_import = 8;
+  
+  // Additional model metadata.
+  repeated StringStringEntryProto metadata_props = 14;
+
+  // Functions defined in this model
+  repeated FunctionProto functions = 100;
+}
+
+// GraphProto defines a graph (or computation) that consists of a list of nodes.
+message GraphProto {
+  // The nodes in the graph.
+  repeated NodeProto node = 1;
+  
+  // The name of the graph.
+  optional string name = 2;
+  
+  // A list of named tensor values, used to specify constant inputs of the graph.
+  repeated TensorProto initializer = 5;
+  
+  // Human-readable documentation for this graph.
+  optional string doc_string = 10;
+  
+  // Information for the values in the graph.
+  repeated ValueInfoProto input = 11;
+  repeated ValueInfoProto output = 12;
+  repeated ValueInfoProto value_info = 13;
+}
+
+// NodeProto represents a computation node in the graph.
+message NodeProto {
+  // Inputs and outputs of the node.
+  repeated string input = 1;
+  repeated string output = 2;
+  
+  // The name of the node.
+  optional string name = 3;
+  
+  // The type of the operation performed by the node.
+  optional string op_type = 4;
+  
+  // The domain of the operation performed by the node.
+  optional string domain = 7;
+  
+  // Additional attributes associated with the operation.
+  repeated AttributeProto attribute = 5;
+  
+  // Human-readable documentation for this node.
+  optional string doc_string = 6;
+}
+
+// AttributeProto defines an attribute used in NodeProto.
+message AttributeProto {
+  // The name of the attribute.
+  optional string name = 1;
+  
+  // The type of the attribute.
+  enum AttributeType {
+    UNDEFINED = 0;
+    FLOAT = 1;
+    INT = 2;
+    STRING = 3;
+    TENSOR = 4;
+    GRAPH = 5;
+    FLOATS = 6;
+    INTS = 7;
+    STRINGS = 8;
+    TENSORS = 9;
+    GRAPHS = 10;
+  }
+  optional AttributeType type = 20;
+  
+  // Exactly ONE of the following fields must be present for this version of ONNX.
+  optional float f = 2;
+  optional int64 i = 3;
+  optional bytes s = 4;
+  optional TensorProto t = 5;
+  optional GraphProto g = 6;
+  
+  // Values for repeated attributes.
+  repeated float floats = 7;
+  repeated int64 ints = 8;
+  repeated bytes strings = 9;
+  repeated TensorProto tensors = 10;
+  repeated GraphProto graphs = 11;
+
+  optional string doc_string = 19;
+}
+
+// TensorProto defines a tensor, which is used for both input and output.
+message TensorProto {
+  enum DataType {
+    UNDEFINED = 0;
+    FLOAT = 1;
+    UINT8 = 2;
+    INT8 = 3;
+    UINT16 = 4;
+    INT16 = 5;
+    INT32 = 6;
+    INT64 = 7;
+    STRING = 8;
+    BOOL = 9;
+    FLOAT16 = 10;
+    DOUBLE = 11;
+    UINT32 = 12;
+    UINT64 = 13;
+    COMPLEX64 = 14;
+    COMPLEX128 = 15;
+    BFLOAT16 = 16;
+  }
+  
+  // The tensor shape.
+  repeated int64 dims = 1;
+  
+  // The data type of the tensor.
+  optional int32 data_type = 2;
+  
+  // For non-raw data, each element takes one entry from the fields below.
+  // For float data, float_data is used.
+  repeated float float_data = 3;
+  repeated int32 int32_data = 4;
+  repeated bytes string_data = 6;
+  repeated int64 int64_data = 7;
+  
+  // Raw binary data if the tensor values are stored in a compressed form.
+  optional bytes raw_data = 9;
+  
+  // Human-readable documentation for this tensor.
+  optional string doc_string = 12;
+  
+  // The name of the tensor.
+  optional string name = 8;
+}
+
+// ValueInfoProto represents the type and shape of inputs and outputs.
+message ValueInfoProto {
+  // The name of the value/tensor.
+  optional string name = 1;
+  
+  // The type and shape information.
+  optional TypeProto type = 2;
+  
+  // Human-readable documentation for this value.
+  optional string doc_string = 3;
+}
+
+// TypeProto represents type information.
+message TypeProto {
+  message Tensor {
+    optional int32 elem_type = 1;
+    optional TensorShapeProto shape = 2;
+  }
+  
+  oneof value {
+    Tensor tensor_type = 1;
+  }
+}
+
+// TensorShapeProto represents shape information.
+message TensorShapeProto {
+  message Dimension {
+    oneof value {
+      int64 dim_value = 1;
+      string dim_param = 2; // For symbolic dimensions
+    }
+  }
+  repeated Dimension dim = 1;
+}
+
+// OperatorSetIdProto represents an operator set used in the model.
+message OperatorSetIdProto {
+  optional string domain = 1; // Default is an empty string (default domain)
+  optional int64 version = 2;
+}
+
+// StringStringEntryProto represents a key-value pair for metadata.
+message StringStringEntryProto {
+  optional string key = 1;
+  optional string value = 2;
+}
+
+// FunctionProto defines function interface
+message FunctionProto {
+  optional string domain = 1;
+  optional int64 since_version = 2;
+  optional string name = 3;
+  optional string doc_string = 4;
+  repeated string input = 5;
+  repeated string output = 6;
+  repeated string attribute = 7;
+  repeated NodeProto node = 8;
+}
