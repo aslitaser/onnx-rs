@@ -263,21 +263,56 @@ impl MemoryPlanner {
             next_id += 1;
         }
 
-        // In a real implementation, you would analyze the graph to determine
-        // tensor shapes, data types, and memory requirements
-        // This is simplified and uses placeholder values
-
+        // Process all nodes in the graph
         for node in &graph.nodes {
             // Process outputs from this node
             for output_name in &node.outputs {
-                // Create a tensor ID for the name
-                let tensor_id = output_name.as_bytes().iter().sum::<u8>() as usize;
+                if output_name.is_empty() {
+                    continue;
+                }
+                
+                // Get the tensor ID from the map
+                let tensor_id = *tensor_id_map.get(output_name).ok_or_else(|| {
+                    Error::InvalidModel(format!("Missing ID for tensor {}", output_name))
+                })?;
 
-                // In a real system, you would compute actual sizes based on shape and data type
-                // For this implementation, we'll use a simple placeholder
-                let size_bytes = 1024; // Placeholder
-                let data_type = DataType::Float32; // Placeholder
-                let alignment = 64; // Common alignment for SIMD operations
+                // Determine if this is a model output
+                let is_model_output = graph.output_nodes.iter().any(|&node_id| {
+                    let node = graph.nodes.iter().find(|n| n.id == node_id).unwrap();
+                    node.outputs.contains(output_name)
+                });
+
+                // Determine tensor shape and data type based on operation
+                let (shape, data_type) = self.infer_tensor_info(graph, node, output_name)?;
+                
+                // Calculate size in bytes based on shape and data type
+                let element_size = data_type.size_in_bytes();
+                let total_elements: usize = shape.iter().product();
+                
+                // Handle potential overflow
+                let size_bytes = total_elements.checked_mul(element_size).ok_or_else(|| {
+                    Error::InvalidModel(format!(
+                        "Integer overflow calculating size for tensor {} with {} elements of size {} bytes",
+                        output_name, total_elements, element_size
+                    ))
+                })?;
+                
+                // Determine appropriate alignment for the data type
+                // For SIMD operations, align to cache line boundaries (64 bytes) for float32/64 tensors
+                // and tensors with dimensions divisible by SIMD vector lengths
+                let alignment = if data_type == DataType::Float32 || data_type == DataType::Float64 {
+                    let is_simd_friendly = shape.iter().any(|&dim| dim % 8 == 0 || dim % 16 == 0);
+                    if is_simd_friendly && size_bytes >= 64 {
+                        64 // Cache line size for SIMD-friendly operations
+                    } else if size_bytes >= 32 {
+                        32 // For smaller but still SIMD-usable tensors
+                    } else {
+                        16 // Minimum alignment for float tensors
+                    }
+                } else {
+                    // For other data types, use a reasonable alignment based on the element size
+                    std::cmp::max(element_size, 8) // At least 8-byte alignment for all tensors
+                };
 
                 tensor_info.insert(
                     tensor_id,
@@ -298,15 +333,40 @@ impl MemoryPlanner {
                     continue; // Skip empty inputs (optional)
                 }
 
-                // Create a tensor ID for the name
-                let tensor_id = input_name.as_bytes().iter().sum::<u8>() as usize;
+                // Get the tensor ID from the map
+                let tensor_id = *tensor_id_map.get(input_name).ok_or_else(|| {
+                    Error::InvalidModel(format!("Missing ID for tensor {}", input_name))
+                })?;
 
                 // Only add if not already present
                 if !tensor_info.contains_key(&tensor_id) {
-                    // For inputs, we would typically get this information from the graph's inputs
-                    let size_bytes = 1024; // Placeholder
-                    let data_type = DataType::Float32; // Placeholder
-                    let alignment = 64;
+                    // For inputs, try to find the tensor info from the graph's inputs
+                    let (shape, data_type) = self.get_input_tensor_info(graph, input_name)?;
+                    
+                    // Calculate size based on shape and data type
+                    let element_size = data_type.size_in_bytes();
+                    let total_elements: usize = shape.iter().product();
+                    
+                    // Handle potential overflow
+                    let size_bytes = total_elements.checked_mul(element_size).ok_or_else(|| {
+                        Error::InvalidModel(format!(
+                            "Integer overflow calculating size for tensor {} with {} elements of size {} bytes",
+                            input_name, total_elements, element_size
+                        ))
+                    })?;
+                    
+                    // Determine appropriate alignment
+                    let alignment = if data_type == DataType::Float32 || data_type == DataType::Float64 {
+                        let is_simd_friendly = shape.iter().any(|&dim| dim % 8 == 0 || dim % 16 == 0);
+                        if is_simd_friendly && size_bytes >= 64 {
+                            64 // Cache line size for SIMD-friendly operations
+                        } else {
+                            16 // Minimum alignment for float tensors
+                        }
+                    } else {
+                        // For other data types, use a reasonable alignment based on the element size
+                        std::cmp::max(element_size, 8) // At least 8-byte alignment for all tensors
+                    };
 
                     tensor_info.insert(
                         tensor_id,
@@ -324,6 +384,188 @@ impl MemoryPlanner {
         }
 
         Ok(tensor_info)
+    }
+    
+    /// Infer tensor shape and data type based on operation and inputs
+    fn infer_tensor_info(&self, graph: &ExecutionGraph, node: &Node, tensor_name: &str) -> Result<(Vec<usize>, DataType)> {
+        // In a production system, this would use the shape inference system
+        // Here we'll implement a minimal version for common operations
+        
+        match node.op_type.as_str() {
+            "Conv" => {
+                // For convolution, we need to get the input shape, kernel shape, etc.
+                // This is simplified - real implementation would parse attributes
+                if node.inputs.len() >= 2 && tensor_name == &node.outputs[0] {
+                    // Output shape depends on input shape, kernel size, stride, padding, etc.
+                    let input_shape = self.get_tensor_shape(graph, &node.inputs[0])?;
+                    let kernel_shape = self.get_tensor_shape(graph, &node.inputs[1])?;
+                    
+                    if input_shape.len() == 4 && kernel_shape.len() == 4 {
+                        // NCHW layout: [batch, channels, height, width]
+                        let batch_size = input_shape[0];
+                        let out_channels = kernel_shape[0];
+                        
+                        // Simple approximation - in reality would account for padding, stride, etc.
+                        let out_h = input_shape[2]; // Simplified
+                        let out_w = input_shape[3]; // Simplified
+                        
+                        return Ok((vec![batch_size, out_channels, out_h, out_w], DataType::Float32));
+                    }
+                }
+            },
+            "MatMul" => {
+                if node.inputs.len() >= 2 && tensor_name == &node.outputs[0] {
+                    let a_shape = self.get_tensor_shape(graph, &node.inputs[0])?;
+                    let b_shape = self.get_tensor_shape(graph, &node.inputs[1])?;
+                    
+                    if a_shape.len() >= 2 && b_shape.len() >= 2 {
+                        // For MatMul: [M,K] * [K,N] -> [M,N]
+                        let m = a_shape[a_shape.len() - 2];
+                        let n = b_shape[b_shape.len() - 1];
+                        
+                        // Handle broadcasting if tensors have more than 2 dimensions
+                        let mut result_shape = Vec::new();
+                        
+                        if a_shape.len() > 2 || b_shape.len() > 2 {
+                            // Broadcast the batch dimensions
+                            let a_batch_dims = &a_shape[0..a_shape.len() - 2];
+                            let b_batch_dims = &b_shape[0..b_shape.len() - 2];
+                            
+                            // Compute the broadcasted batch dimensions
+                            let batch_dims = self.broadcast_shapes(a_batch_dims, b_batch_dims)?;
+                            result_shape.extend_from_slice(&batch_dims);
+                        }
+                        
+                        // Add the matrix multiplication result dimensions
+                        result_shape.push(m);
+                        result_shape.push(n);
+                        
+                        return Ok((result_shape, DataType::Float32));
+                    }
+                }
+            },
+            // Add cases for common operations: Add, Mul, Relu, etc.
+            "Add" | "Sub" | "Mul" | "Div" => {
+                if node.inputs.len() >= 2 && tensor_name == &node.outputs[0] {
+                    let a_shape = self.get_tensor_shape(graph, &node.inputs[0])?;
+                    let b_shape = self.get_tensor_shape(graph, &node.inputs[1])?;
+                    
+                    // For elementwise ops, output shape is the broadcasted shape
+                    let output_shape = self.broadcast_shapes(&a_shape, &b_shape)?;
+                    
+                    // Output data type is the same as input (assuming same type inputs)
+                    let data_type = self.get_tensor_data_type(graph, &node.inputs[0])?;
+                    
+                    return Ok((output_shape, data_type));
+                }
+            },
+            "Relu" | "Sigmoid" | "Tanh" | "LeakyRelu" => {
+                if node.inputs.len() >= 1 && tensor_name == &node.outputs[0] {
+                    // These activation functions preserve shape and data type
+                    let input_shape = self.get_tensor_shape(graph, &node.inputs[0])?;
+                    let input_data_type = self.get_tensor_data_type(graph, &node.inputs[0])?;
+                    
+                    return Ok((input_shape, input_data_type));
+                }
+            },
+            // Default case for unknown operations
+            _ => {
+                // For unknown operations, attempt to copy shape from first input
+                if !node.inputs.is_empty() && tensor_name == &node.outputs[0] {
+                    let input_shape = self.get_tensor_shape(graph, &node.inputs[0])?;
+                    let input_data_type = self.get_tensor_data_type(graph, &node.inputs[0])?;
+                    
+                    return Ok((input_shape, input_data_type));
+                }
+            }
+        }
+        
+        // Fallback: If we can't infer the shape, use a reasonable default
+        Ok((vec![1, 1, 64, 64], DataType::Float32))
+    }
+    
+    /// Get the shape of a tensor from the graph
+    fn get_tensor_shape(&self, graph: &ExecutionGraph, tensor_name: &str) -> Result<Vec<usize>> {
+        // In a production system, this would query the shape inference system or the model
+        // For this implementation, we'll use some reasonable defaults based on the tensor name
+        
+        if tensor_name.contains("weight") || tensor_name.contains("kernel") {
+            // Weights for conv are typically [out_channels, in_channels, kernel_h, kernel_w]
+            Ok(vec![64, 3, 3, 3])
+        } else if tensor_name.contains("bias") {
+            // Bias is typically [out_channels]
+            Ok(vec![64])
+        } else if tensor_name.contains("input") || tensor_name.contains("image") {
+            // Input tensors are typically [batch_size, channels, height, width]
+            Ok(vec![1, 3, 224, 224])
+        } else if tensor_name.contains("pool") || tensor_name.contains("feature") {
+            // Feature maps often have shape [batch_size, channels, height, width]
+            Ok(vec![1, 64, 112, 112])
+        } else if tensor_name.contains("fc") || tensor_name.contains("dense") {
+            // Fully connected layers typically have shape [batch_size, features]
+            Ok(vec![1, 1024])
+        } else if tensor_name.contains("output") || tensor_name.contains("logits") {
+            // Output tensors often have shape [batch_size, num_classes]
+            Ok(vec![1, 1000])
+        } else {
+            // Default shape for unknown tensors
+            Ok(vec![1, 64, 64, 64])
+        }
+    }
+    
+    /// Get the data type of a tensor from the graph
+    fn get_tensor_data_type(&self, graph: &ExecutionGraph, tensor_name: &str) -> Result<DataType> {
+        // In a production system, this would query the model's tensor definitions
+        // Here we'll just return Float32 for all tensors
+        Ok(DataType::Float32)
+    }
+    
+    /// Get tensor info for input tensors
+    fn get_input_tensor_info(&self, graph: &ExecutionGraph, tensor_name: &str) -> Result<(Vec<usize>, DataType)> {
+        // In a production system, this would query the model's input definitions
+        // For this implementation, we'll use the same logic as get_tensor_shape
+        let shape = self.get_tensor_shape(graph, tensor_name)?;
+        let data_type = self.get_tensor_data_type(graph, tensor_name)?;
+        
+        Ok((shape, data_type))
+    }
+    
+    /// Broadcast two shapes according to broadcasting rules
+    fn broadcast_shapes(&self, shape1: &[usize], shape2: &[usize]) -> Result<Vec<usize>> {
+        let rank1 = shape1.len();
+        let rank2 = shape2.len();
+        let result_rank = std::cmp::max(rank1, rank2);
+        
+        let mut result_shape = Vec::with_capacity(result_rank);
+        
+        for i in 0..result_rank {
+            let dim1 = if i >= result_rank - rank1 {
+                shape1[i - (result_rank - rank1)]
+            } else {
+                1
+            };
+            
+            let dim2 = if i >= result_rank - rank2 {
+                shape2[i - (result_rank - rank2)]
+            } else {
+                1
+            };
+            
+            if dim1 == 1 {
+                result_shape.push(dim2);
+            } else if dim2 == 1 {
+                result_shape.push(dim1);
+            } else if dim1 == dim2 {
+                result_shape.push(dim1);
+            } else {
+                return Err(Error::InvalidModel(format!(
+                    "Cannot broadcast shapes {:?} and {:?}: incompatible dimensions at index {}",
+                    shape1, shape2, i
+                )));
+            }
+        }
+        
+        Ok(result_shape)
     }
     
     /// Collect all tensor names from the graph
