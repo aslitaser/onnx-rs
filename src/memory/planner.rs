@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::cmp;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::model::{ExecutionGraph, NodeId};
@@ -237,9 +238,10 @@ impl MemoryPlanner {
                 first_use // No consumers, tensor is used only once
             };
 
-            // Create a tensor ID for the name
-            // In a real system, this would use the tensor_name_map from the execution engine
-            let tensor_id = tensor_name.as_bytes().iter().sum::<u8>() as usize;
+            // Get the tensor ID from the tensor_id_map
+            let tensor_id = *tensor_id_map.get(tensor_name).ok_or_else(|| {
+                Error::InvalidModel(format!("Missing ID for tensor {}", tensor_name))
+            })?;
 
             lifetimes.insert(tensor_id, (first_use, last_use));
         }
@@ -250,6 +252,16 @@ impl MemoryPlanner {
     /// Gather information about tensors in the graph
     fn gather_tensor_info(&self, graph: &ExecutionGraph) -> Result<HashMap<TensorId, TensorMemoryInfo>> {
         let mut tensor_info = HashMap::new();
+        let mut tensor_id_map = HashMap::new();
+        let mut next_id: TensorId = 1; // Start IDs from 1 to reserve 0 for special cases
+
+        // Create a mapping from tensor names to unique IDs
+        let tensor_names = self.collect_tensor_names(graph);
+        for name in tensor_names {
+            let id = next_id;
+            tensor_id_map.insert(name, id);
+            next_id += 1;
+        }
 
         // In a real implementation, you would analyze the graph to determine
         // tensor shapes, data types, and memory requirements
@@ -313,19 +325,40 @@ impl MemoryPlanner {
 
         Ok(tensor_info)
     }
+    
+    /// Collect all tensor names from the graph
+    fn collect_tensor_names(&self, graph: &ExecutionGraph) -> HashSet<String> {
+        let mut tensor_names = HashSet::new();
+        
+        // Add all inputs and outputs from all nodes
+        for node in &graph.nodes {
+            for input_name in &node.inputs {
+                if !input_name.is_empty() {
+                    tensor_names.insert(input_name.clone());
+                }
+            }
+            
+            for output_name in &node.outputs {
+                if !output_name.is_empty() {
+                    tensor_names.insert(output_name.clone());
+                }
+            }
+        }
+        
+        tensor_names
+    }
 
     /// Analyze opportunities for in-place operations
     pub fn inplace_operations_analysis(&self, graph: &ExecutionGraph) -> Result<Vec<InplaceOpportunity>> {
         let mut opportunities = Vec::new();
+        let tensor_info = self.gather_tensor_info(graph)?;
+        let tensor_id_map = self.create_tensor_id_map(graph)?;
 
         for node in &graph.nodes {
-            // Check for operations that can be done in-place
-            // This is specific to the operator type and its properties
-            // For example, element-wise operations can often be done in-place
-
-            // For illustration, let's assume all nodes with op_type containing "Relu" or "Add"
-            // can be performed in-place with their first input
-            if node.op_type.contains("Relu") || node.op_type.contains("Add") {
+            // Different operations have different in-place capabilities
+            match node.op_type.as_str() {
+                // Unary operations that can generally be done in-place
+                "Relu" | "LeakyRelu" | "Sigmoid" | "Tanh" | "Abs" | "Exp" | "Log" | "Sqrt" | "Neg" => {
                 if !node.inputs.is_empty() && !node.inputs[0].is_empty() && !node.outputs.is_empty() {
                     let input_name = &node.inputs[0];
                     let output_name = &node.outputs[0];
@@ -349,6 +382,22 @@ impl MemoryPlanner {
         }
 
         Ok(opportunities)
+    }
+    
+    /// Create a mapping from tensor names to tensor IDs
+    fn create_tensor_id_map(&self, graph: &ExecutionGraph) -> Result<HashMap<String, TensorId>> {
+        let mut tensor_id_map = HashMap::new();
+        let mut next_id: TensorId = 1; // Start IDs from 1 to reserve 0 for special cases
+
+        // Create a mapping from tensor names to unique IDs
+        let tensor_names = self.collect_tensor_names(graph);
+        for name in tensor_names {
+            let id = next_id;
+            tensor_id_map.insert(name, id);
+            next_id += 1;
+        }
+        
+        Ok(tensor_id_map)
     }
 
     /// Apply in-place optimizations to tensor info and lifetimes
