@@ -97,18 +97,31 @@ impl Clone for MemoryBlock {
 /// Memory allocator trait for ONNX runtime
 pub trait MemoryAllocator: Send + Sync {
     /// Allocate a block of memory with the specified size and alignment
-    fn allocate(&mut self, size: usize, alignment: usize) -> Result<MemoryBlock>;
+    /// 
+    /// This method can be called from multiple threads concurrently.
+    /// Implementations should use internal synchronization if needed.
+    fn allocate(&self, size: usize, alignment: usize) -> Result<MemoryBlock>;
 
     /// Deallocate a memory block
-    fn deallocate(&mut self, block: MemoryBlock);
+    /// 
+    /// This method can be called from multiple threads concurrently.
+    /// Implementations should use internal synchronization if needed.
+    fn deallocate(&self, block: MemoryBlock);
 
     /// Reset the allocator, deallocating all memory
-    fn reset(&mut self);
+    /// 
+    /// This is typically called when restarting execution or cleaning up.
+    /// It's not expected to be called concurrently with other methods.
+    fn reset(&self);
 
     /// Get the amount of available memory
+    /// 
+    /// This method can be called from multiple threads concurrently.
     fn available_memory(&self) -> usize;
 
     /// Get the amount of allocated memory
+    /// 
+    /// This method can be called from multiple threads concurrently.
     fn allocated_memory(&self) -> usize;
 }
 
@@ -131,7 +144,7 @@ impl SystemAllocator {
 }
 
 impl MemoryAllocator for SystemAllocator {
-    fn allocate(&mut self, size: usize, alignment: usize) -> Result<MemoryBlock> {
+    fn allocate(&self, size: usize, alignment: usize) -> Result<MemoryBlock> {
         // Ensure size is not zero
         let size = std::cmp::max(1, size);
 
@@ -190,7 +203,7 @@ impl MemoryAllocator for SystemAllocator {
         Ok(MemoryBlock::new(ptr, size, alignment, 0))
     }
 
-    fn deallocate(&mut self, block: MemoryBlock) {
+    fn deallocate(&self, block: MemoryBlock) {
         // Lock the mutex to update allocations map
         let mut allocations = match self.allocations.lock() {
             Ok(guard) => guard,
@@ -212,9 +225,9 @@ impl MemoryAllocator for SystemAllocator {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&self) {
         // Lock the mutex to update allocations map
-        let allocations_opt = self.allocations.lock().ok().map(|allocations| {
+        let allocations_opt = self.allocations.lock().ok().map(|mut allocations| {
             std::mem::take(&mut *allocations)
         });
         
@@ -292,7 +305,7 @@ impl ArenaAllocator {
 }
 
 impl MemoryAllocator for ArenaAllocator {
-    fn allocate(&mut self, size: usize, alignment: usize) -> Result<MemoryBlock> {
+    fn allocate(&self, size: usize, alignment: usize) -> Result<MemoryBlock> {
         let memory_block = self.memory_block.as_ref().ok_or_else(|| {
             Error::InvalidModel("Arena allocator has been reset".to_string())
         })?;
@@ -336,7 +349,7 @@ impl MemoryAllocator for ArenaAllocator {
         ))
     }
 
-    fn deallocate(&mut self, _block: MemoryBlock) {
+    fn deallocate(&self, _block: MemoryBlock) {
         // Individual deallocations are not supported in the arena allocator
         // Memory will be reclaimed on reset() or drop()
         
@@ -346,7 +359,7 @@ impl MemoryAllocator for ArenaAllocator {
         // deallocate does not actually free memory in ArenaAllocator
     }
 
-    fn reset(&mut self) {
+    fn reset(&self) {
         // Reset allocator state without deallocating the underlying memory
         if let Ok(mut offset) = self.offset.lock() {
             *offset = 0;
@@ -402,25 +415,19 @@ impl PoolBlock {
     /// Increment the reference count and return whether this was successful
     /// Returns false if the block is not in the pool
     fn acquire(&self) -> bool {
-        // First check if the block is in the pool
-        if !self.in_pool.load(Ordering::Acquire) {
-            return false;
-        }
-
-        // Try to increment reference count, starting from 0
-        let result = self.ref_count.compare_exchange(
-            0, 1, 
-            Ordering::AcqRel, 
+        // Try to atomically change in_pool from true to false
+        // This prevents the race condition between checking and modifying
+        if !self.in_pool.compare_exchange(
+            true, false,
+            Ordering::AcqRel,
             Ordering::Relaxed
-        );
-
-        // If successful, mark as not in pool
-        if result.is_ok() {
-            self.in_pool.store(false, Ordering::Release);
-            true
-        } else {
-            false
+        ).is_ok() {
+            return false;  // Block is not in pool or another thread grabbed it first
         }
+
+        // We have exclusive access now, set reference count to 1
+        self.ref_count.store(1, Ordering::Release);
+        true
     }
 
     /// Increment the reference count (for when a block is shared)
@@ -526,7 +533,7 @@ impl PoolAllocator {
 }
 
 impl MemoryAllocator for PoolAllocator {
-    fn allocate(&mut self, size: usize, alignment: usize) -> Result<MemoryBlock> {
+    fn allocate(&self, size: usize, alignment: usize) -> Result<MemoryBlock> {
         // Check if requested size fits in our blocks with clear error message
         if size > self.block_size {
             return Err(Error::InvalidModel(format!(
@@ -554,20 +561,17 @@ impl MemoryAllocator for PoolAllocator {
             )),
         };
         
-        // Look for an available block in the pool
-        let mut i = 0;
-        while i < pool_guard.len() {
-            let pool_block = &pool_guard[i];
-            
-            // Try to acquire this block
-            if pool_block.acquire() {
-                // Successfully acquired the block
-                allocated_pool_block = Some(pool_block.clone());
-                break;
-            }
-            
-            i += 1;
-        }
+        // Look for an available block in the pool efficiently using iter instead of indexed loop
+        allocated_pool_block = pool_guard.iter()
+            .find_map(|pool_block| {
+                // Try to acquire this block
+                if pool_block.acquire() {
+                    // Successfully acquired the block
+                    Some(pool_block.clone())
+                } else {
+                    None
+                }
+            });
         
         // If no block was found in the pool, allocate a new one
         if allocated_pool_block.is_none() {
@@ -581,16 +585,21 @@ impl MemoryAllocator for PoolAllocator {
             new_block.acquire();
             
             // Add it to the pool
-            match self.pool.lock() {
+            let added_to_pool = match self.pool.lock() {
                 Ok(mut guard) => {
                     guard.push(new_block.clone());
+                    true
                 },
-                Err(_) => {
-                    // If we can't add to the pool, we'll still use the block,
-                    // but it will leak when deallocated since it won't be in the pool
-                    // Log warning in a real implementation
+                Err(e) => {
+                    // If we can't add to the pool, we shouldn't proceed
+                    // as it would leak memory when deallocated
+                    new_block.release(); // Ensure reference count is decremented
+                    return Err(Error::InvalidModel(format!(
+                        "Failed to lock pool mutex: {}. Cannot safely allocate memory.",
+                        e
+                    )));
                 }
-            }
+            };
             
             allocated_pool_block = Some(new_block);
         }
@@ -635,16 +644,23 @@ impl MemoryAllocator for PoolAllocator {
         ))
     }
 
-    fn deallocate(&mut self, block: MemoryBlock) {
+    fn deallocate(&self, block: MemoryBlock) {
         let ptr_key = block.ptr().as_ptr() as usize;
         
         // Look up the pool block in our map
         let pool_block = match self.block_map.lock() {
             Ok(mut guard) => guard.remove(&ptr_key),
-            Err(_) => {
-                // Can't access the map, log error in real implementation
-                // We can't deallocate properly, which might cause a memory leak
-                return;
+            Err(e) => {
+                // Log the error but continue with best effort deallocate
+                // In a production system, this would be logged with severity
+                eprintln!("ERROR: Failed to lock block map for deallocation: {}. Possible memory leak.", e);
+                
+                // Try one more time after a short delay
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                match self.block_map.lock() {
+                    Ok(mut guard) => guard.remove(&ptr_key),
+                    Err(_) => None, // Give up if it fails again
+                }
             }
         };
         
@@ -662,36 +678,80 @@ impl MemoryAllocator for PoolAllocator {
         }
     }
 
-    fn reset(&mut self) {
-        // Acquire locks for both collections
-        let block_map = match self.block_map.lock() {
-            Ok(guard) => guard,
-            Err(_) => return, // Can't reset if we can't lock
-        };
-        
-        // We'll return blocks to the pool only if their ref count is 0
-        // Get all blocks from the map
+    fn reset(&self) {
+        // Avoid deadlocks by cloning the Arc's but not acquiring locks yet
         let block_map_arc = self.block_map.clone();
         let pool_arc = self.pool.clone();
         
-        // Use a background thread to avoid deadlocks when acquiring multiple locks
-        std::thread::spawn(move || {
-            if let Ok(mut block_map) = block_map_arc.lock() {
-                // Clear the map, moving all blocks out
-                let blocks = std::mem::take(&mut *block_map);
-                
-                // For each block, check ref count and return to pool if zero
-                for (_, block) in blocks {
-                    if block.ref_count.load(Ordering::Relaxed) == 0 {
-                        block.return_to_pool();
-                    } else {
-                        // Re-insert into map if still referenced
-                        let ptr_key = block.block.ptr().as_ptr() as usize;
-                        block_map.insert(ptr_key, block);
-                    }
+        // First try to reset with a direct approach
+        let reset_result = (|| -> Result<()> {
+            // Use try_lock to avoid potential deadlocks
+            // This will fail immediately if the lock can't be acquired
+            let mut block_map = match block_map_arc.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return Err(Error::InvalidModel("Could not acquire block map lock".to_string())),
+            };
+            
+            let mut pool = match pool_arc.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return Err(Error::InvalidModel("Could not acquire pool lock".to_string())),
+            };
+            
+            // Clear the map, moving all blocks out
+            let blocks = std::mem::take(&mut *block_map);
+            
+            // For each block, check ref count and return to pool if zero
+            for (_, block) in blocks {
+                if block.ref_count.load(Ordering::Relaxed) == 0 {
+                    block.return_to_pool();
+                    pool.push(block);
+                } else {
+                    // Re-insert into map if still referenced
+                    let ptr_key = block.block.ptr().as_ptr() as usize;
+                    block_map.insert(ptr_key, block);
                 }
             }
-        });
+            
+            Ok(())
+        })();
+        
+        // If the direct approach failed, use a more cautious approach
+        if reset_result.is_err() {
+            // Use a background thread to avoid deadlocks when acquiring multiple locks
+            // This is a fallback and should rarely be needed
+            std::thread::spawn(move || {
+                // Wait a bit to let any pending operations complete
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                
+                // Try to reset with proper lock ordering to avoid deadlocks
+                if let Ok(mut block_map) = block_map_arc.lock() {
+                    // Clear the map, moving all blocks out
+                    let blocks = std::mem::take(&mut *block_map);
+                    
+                    // For each block, check ref count and return to pool if zero
+                    for (_, block) in blocks {
+                        if block.ref_count.load(Ordering::Relaxed) == 0 {
+                            block.return_to_pool();
+                            
+                            // Try to add back to pool, but don't hold the block_map lock while doing so
+                            if let Ok(mut pool) = pool_arc.lock() {
+                                pool.push(block.clone());
+                            }
+                            
+                            // If we couldn't add to pool, re-insert with zero ref count
+                            if !block.in_pool.load(Ordering::Relaxed) {
+                                let ptr_key = block.block.ptr().as_ptr() as usize;
+                                block_map.insert(ptr_key, block);
+                            }
+                        } else {
+                            // Re-insert into map if still referenced
+                            let ptr_key = block.block.ptr().as_ptr() as usize;
+                            block_map.insert(ptr_key, block);
+                        }
+                    }
+                }
+            });
+        }
         
         // Reset allocation counter (actual count is maintained by reference counts)
         self.allocated.store(0, Ordering::Relaxed);

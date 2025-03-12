@@ -239,6 +239,9 @@ impl MemoryPlanner {
         let mut lifetimes = HashMap::new();
         let mut tensor_producers = HashMap::new();
         let mut tensor_consumers = HashMap::new();
+        
+        // Create a tensor ID map for this analysis
+        let tensor_id_map = self.create_tensor_id_map(graph)?;
 
         // Build tensor producer and consumer maps
         for (idx, &node_id) in execution_order.iter().enumerate() {
@@ -270,7 +273,9 @@ impl MemoryPlanner {
 
             // Find the last consumer, or use the end of execution if this is an output
             let is_output = graph.output_nodes.iter().any(|&node_id| {
-                let node = graph.nodes.iter().find(|n| n.id == node_id).unwrap();
+                let node = graph.nodes.iter().find(|n| n.id == node_id).ok_or_else(|| {
+                    Error::InvalidGraph(format!("Node with ID {} not found", node_id))
+                }).unwrap_or_else(|_| panic!("Invalid graph: Node not found"));
                 node.outputs.contains(tensor_name)
             });
 
@@ -729,8 +734,14 @@ impl MemoryPlanner {
         
         // Check if the tensor is a model output
         let is_model_output = graph.output_nodes.iter().any(|&node_id| {
-            let node = graph.nodes.iter().find(|n| n.id == node_id).unwrap_or_else(|| panic!("Node not found"));
-            node.outputs.contains(&tensor_name)
+            graph.nodes.iter()
+                .find(|n| n.id == node_id)
+                .map(|node| node.outputs.contains(&tensor_name))
+                .unwrap_or_else(|| {
+                    // Log the missing node but continue with a reasonable default
+                    eprintln!("Warning: Node with ID {} not found in graph", node_id);
+                    false
+                })
         });
         
         // If it's a model output, it cannot be used in-place
@@ -1068,6 +1079,22 @@ impl MemoryPlanner {
             let base_block = &buffer_blocks[buffer_index];
             
             // Create a sub-block for this tensor
+            // Calculate pointer with bounds checking
+            if allocation.offset > base_block.size() {
+                return Err(Error::InvalidModel(format!(
+                    "Invalid allocation offset {} exceeds base block size {}",
+                    allocation.offset, base_block.size()
+                )));
+            }
+            
+            let remaining_size = base_block.size() - allocation.offset;
+            if allocation.size_bytes > remaining_size {
+                return Err(Error::InvalidModel(format!(
+                    "Invalid allocation size {} exceeds remaining space {} at offset {}",
+                    allocation.size_bytes, remaining_size, allocation.offset
+                )));
+            }
+            
             let ptr = unsafe {
                 let base_ptr = base_block.ptr().as_ptr();
                 let tensor_ptr = base_ptr.add(allocation.offset);

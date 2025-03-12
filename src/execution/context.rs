@@ -192,6 +192,16 @@ impl WorkspaceGuard {
     
     /// Get a mutable slice to the workspace
     pub fn data(&mut self) -> &mut [u8] {
+        if self.ptr.is_null() {
+            // Return an empty slice if the pointer is null
+            return &mut [];
+        }
+        
+        // SAFETY: The WorkspaceGuard ensures that:
+        // 1. The pointer is valid for the lifetime of the guard
+        // 2. The memory pointed to is properly initialized
+        // 3. The memory range [ptr, ptr+size) is owned exclusively by this guard
+        // 4. Alignment requirements are satisfied by the allocator
         unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
     }
     
@@ -244,20 +254,30 @@ impl ExecutionContext {
     }
     
     /// Get a tensor by ID (thread-safe read access)
-    pub fn get_tensor(&self, tensor_id: &TensorId) -> Option<Tensor> {
-        if let Ok(tensors) = self.tensors.read() {
-            tensors.get(tensor_id).cloned()
-        } else {
-            None
+    pub fn get_tensor(&self, tensor_id: &TensorId) -> Result<Option<Tensor>> {
+        match self.tensors.read() {
+            Ok(tensors) => Ok(tensors.get(tensor_id).cloned()),
+            Err(e) => Err(Error::InvalidModel(format!(
+                "Failed to acquire read lock for tensors: {}", e
+            )))
         }
     }
     
-    /// Get a mutable tensor by ID (acquires write lock)
+    /// Try to get a tensor by ID, with a simplified interface that returns None on lock failure
+    /// This is useful for non-critical operations where lock failure is acceptable
+    pub fn try_get_tensor(&self, tensor_id: &TensorId) -> Option<Tensor> {
+        self.tensors.read().ok()
+            .and_then(|tensors| tensors.get(tensor_id).cloned())
+    }
+    
+    /// Get a tensor by ID for updating its value (semantically the same as get_tensor but with a name
+    /// that indicates the intent is to modify the tensor after retrieval)
     pub fn get_tensor_for_update(&self, tensor_id: &TensorId) -> Result<Option<Tensor>> {
-        if let Ok(tensors) = self.tensors.read() {
-            Ok(tensors.get(tensor_id).cloned())
-        } else {
-            Err(Error::InvalidModel("Failed to acquire read lock for tensors".to_string()))
+        match self.tensors.read() {
+            Ok(tensors) => Ok(tensors.get(tensor_id).cloned()),
+            Err(e) => Err(Error::InvalidModel(format!(
+                "Failed to acquire read lock for tensors: {}", e
+            )))
         }
     }
     
