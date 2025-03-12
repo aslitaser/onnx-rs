@@ -87,19 +87,37 @@ pub struct MemoryPlan {
 pub type BufferMap = HashMap<TensorId, MemoryBlock>;
 
 /// Memory planner for optimizing memory usage during execution
-pub struct MemoryPlanner;
+pub struct MemoryPlanner {
+    /// Current execution graph being analyzed
+    current_graph: Option<Arc<ExecutionGraph>>,
+    /// Cache of tensor information
+    tensor_info_cache: HashMap<TensorId, TensorMemoryInfo>,
+    /// Cache of tensor ID mappings
+    tensor_id_map_cache: HashMap<String, TensorId>,
+}
 
 impl MemoryPlanner {
     /// Create a new memory planner
     pub fn new() -> Self {
-        Self
+        Self {
+            current_graph: None,
+            tensor_info_cache: HashMap::new(),
+            tensor_id_map_cache: HashMap::new(),
+        }
     }
 
     /// Plan memory usage for an execution graph
     pub fn plan_memory_usage(
-        &self,
+        &mut self,
         graph: &ExecutionGraph,
     ) -> Result<MemoryPlan> {
+        // Store the current graph for reference
+        self.current_graph = Some(Arc::new(graph.clone()));
+        
+        // Clear caches for fresh analysis
+        self.tensor_info_cache.clear();
+        self.tensor_id_map_cache.clear();
+        
         // Determine execution order
         let execution_order = self.determine_execution_order(graph)?;
 
@@ -108,6 +126,9 @@ impl MemoryPlanner {
 
         // Gather tensor information
         let tensor_info = self.gather_tensor_info(graph)?;
+        
+        // Cache the tensor info for later use
+        self.tensor_info_cache = tensor_info.clone();
 
         // Find in-place operation opportunities
         let inplace_ops = self.inplace_operations_analysis(graph)?;
@@ -322,7 +343,7 @@ impl MemoryPlanner {
                         size_bytes,
                         data_type,
                         alignment,
-                        allow_inplace: true, // Default to allowed
+                        allow_inplace: !is_model_output, // Outputs can be overwritten unless they're model outputs
                     },
                 );
             }
@@ -604,25 +625,36 @@ impl MemoryPlanner {
                 if !node.inputs.is_empty() && !node.inputs[0].is_empty() && !node.outputs.is_empty() {
                     let input_name = &node.inputs[0];
                     let output_name = &node.outputs[0];
-
-                    // Create tensor IDs
-                    let input_id = input_name.as_bytes().iter().sum::<u8>() as usize;
-                    let output_id = output_name.as_bytes().iter().sum::<u8>() as usize;
-
-                    // In a real system, you would check shapes and data types
-                    // to ensure they're compatible
-                    let size_bytes = 1024; // Placeholder
-
-                    opportunities.push(InplaceOpportunity {
-                        node_id: node.id,
-                        input_id,
-                        output_id,
-                        size_bytes,
-                    });
+                    
+                    // Get tensor IDs from the map
+                    if let (Some(&input_id), Some(&output_id)) = (
+                        tensor_id_map.get(input_name),
+                        tensor_id_map.get(output_name)
+                    ) {
+                        // Check if input can be overwritten
+                        if let Some(input_info) = tensor_info.get(&input_id) {
+                            if input_info.allow_inplace {
+                                // Check that input is only used once (in this operation)
+                                if self.is_last_use_of_tensor(graph, input_name, node.id)? {
+                                    // Get the size of the tensor
+                                    let size_bytes = input_info.size_bytes;
+                                    
+                                    opportunities.push(InplaceOpportunity {
+                                        node_id: node.id,
+                                        input_id,
+                                        output_id,
+                                        size_bytes,
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
-            }
+            },
+            _ => {}
         }
-
+    }
+        
         Ok(opportunities)
     }
     
@@ -640,6 +672,43 @@ impl MemoryPlanner {
         }
         
         Ok(tensor_id_map)
+    }
+    
+    /// Check if this is the last use of a tensor in the graph
+    fn is_last_use_of_tensor(&self, graph: &ExecutionGraph, tensor_name: &str, current_node_id: NodeId) -> Result<bool> {
+        // Get the execution order
+        let execution_order = self.determine_execution_order(graph)?;
+        
+        // Find the position of the current node
+        let current_pos = execution_order.iter().position(|&id| id == current_node_id).ok_or_else(|| {
+            Error::InvalidGraph(format!("Node with ID {} not found in execution order", current_node_id))
+        })?;
+        
+        // Check all nodes after the current one
+        for &node_id in &execution_order[current_pos + 1..] {
+            let node = graph.nodes.iter().find(|n| n.id == node_id).ok_or_else(|| {
+                Error::InvalidGraph(format!("Node with ID {} not found", node_id))
+            })?;
+            
+            // If any node uses this tensor as input, it's not the last use
+            if node.inputs.contains(&tensor_name) {
+                return Ok(false);
+            }
+        }
+        
+        // Check if the tensor is a model output
+        let is_model_output = graph.output_nodes.iter().any(|&node_id| {
+            let node = graph.nodes.iter().find(|n| n.id == node_id).unwrap_or_else(|| panic!("Node not found"));
+            node.outputs.contains(&tensor_name)
+        });
+        
+        // If it's a model output, it cannot be used in-place
+        if is_model_output {
+            return Ok(false);
+        }
+        
+        // If we haven't found any further uses, it's the last use
+        Ok(true)
     }
 
     /// Apply in-place optimizations to tensor info and lifetimes
@@ -746,6 +815,8 @@ impl MemoryPlanner {
                                     second_id: id2,
                                     size_bytes: shared_size,
                                 });
+                            }
+                        }
                     }
                 }
             }
