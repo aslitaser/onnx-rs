@@ -693,42 +693,73 @@ impl MemoryPlanner {
     pub fn buffer_sharing_analysis(
         &self,
         lifetimes: &HashMap<TensorId, (usize, usize)>,
-    ) -> Vec<SharingOpportunity> {
+    ) -> Result<Vec<SharingOpportunity>> {
         let mut opportunities = Vec::new();
 
-        // Create a list of tensors sorted by size (largest first)
-        let mut tensor_ids: Vec<_> = lifetimes.keys().cloned().collect();
-        tensor_ids.sort_unstable_by(|a, b| {
-            let size_a = 1024; // Placeholder - would use actual sizes
-            let size_b = 1024; // Placeholder
-            size_b.cmp(&size_a) // Sort largest first
-        });
+        // Create a list of tensors with their sizes
+        let mut tensors_with_sizes: Vec<(TensorId, usize, (usize, usize))> = Vec::new();
+        for (&tensor_id, &lifetime) in lifetimes.iter() {
+            if let Some(info) = self.tensor_info_cache.get(&tensor_id) {
+                tensors_with_sizes.push((tensor_id, info.size_bytes, lifetime));
+            }
+        }
+
+        // Sort tensors by size (largest first)
+        tensors_with_sizes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
         // Check each pair of tensors for sharing opportunities
-        for i in 0..tensor_ids.len() {
-            for j in i + 1..tensor_ids.len() {
-                let id1 = tensor_ids[i];
-                let id2 = tensor_ids[j];
+        for i in 0..tensors_with_sizes.len() {
+            let (id1, size1, (first1, last1)) = tensors_with_sizes[i];
+            
+            // Skip tensors that require special alignment if they're very small
+            // (sharing very small tensors often doesn't save much memory)
+            if size1 < 64 {
+                continue;
+            }
+            
+            for j in i + 1..tensors_with_sizes.len() {
+                let (id2, size2, (first2, last2)) = tensors_with_sizes[j];
 
                 // Check if lifetimes don't overlap
-                if let (Some(&(first1, last1)), Some(&(first2, last2))) =
-                    (lifetimes.get(&id1), lifetimes.get(&id2))
-                {
-                    if last1 < first2 || last2 < first1 {
-                        // Tensors don't overlap in time, they can share memory
-                        let size_bytes = 1024; // Placeholder - would use minimum of both sizes
-
-                        opportunities.push(SharingOpportunity {
-                            first_id: id1,
-                            second_id: id2,
-                            size_bytes,
-                        });
+                if last1 < first2 || last2 < first1 {
+                    // Tensors don't overlap in time, check alignment compatibility
+                    if let (Some(info1), Some(info2)) = (
+                        self.tensor_info_cache.get(&id1), 
+                        self.tensor_info_cache.get(&id2)
+                    ) {
+                        // Check if they have compatible alignment requirements
+                        // For simplicity, we'll only share buffers with the same alignment
+                        // A more sophisticated implementation would adjust offsets to satisfy
+                        // both alignment requirements
+                        if info1.alignment == info2.alignment {
+                            // Check data type compatibility
+                            // For some data types, we might require additional padding
+                            let compatible_types = (info1.data_type == info2.data_type) ||
+                                               (info1.data_type.size_in_bytes() == info2.data_type.size_in_bytes());
+                            
+                            if compatible_types {
+                                // Use the smaller of the two sizes for the amount saved
+                                let shared_size = std::cmp::min(size1, size2);
+                                
+                                opportunities.push(SharingOpportunity {
+                                    first_id: id1,
+                                    second_id: id2,
+                                    size_bytes: shared_size,
+                                });
                     }
                 }
             }
         }
 
-        opportunities
+        // Apply heuristic to limit the number of sharing opportunities
+        // Too many sharing edges can make allocation complex
+        if opportunities.len() > 100 {
+            // Sort by size saved (largest first) and take the top 100
+            opportunities.sort_unstable_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+            opportunities.truncate(100);
+        }
+
+        Ok(opportunities)
     }
 
     /// Compute the optimal allocation order for tensors
@@ -770,7 +801,7 @@ impl MemoryPlanner {
         let mut bytes_saved = 0;
         
         // Get sharing opportunities
-        let sharing_opportunities = self.buffer_sharing_analysis(&plan.lifetimes);
+        let sharing_opportunities = self.buffer_sharing_analysis(&plan.lifetimes)?;
         
         // Create a map of tensor sizes
         let tensor_sizes: Vec<_> = plan.tensor_info.iter()
