@@ -13,7 +13,7 @@ pub use model::{OnnxModel, Node, Graph, NodeId, Tensor, TensorInfo, ModelMetadat
 pub use error::{Error, Result};
 pub use ops::tensor::Tensor as ComputeTensor;
 pub use ops::registry::{Operator, OperatorRegistry};
-pub use execution::engine::{ExecutionEngine, ThreadSafeTensorCache};
+pub use execution::engine::{ExecutionEngine, ThreadSafeTensorCache, ExecutionPriority};
 pub use execution::context::{ExecutionContext, ExecutionOptions, OptimizationLevel, WorkspaceGuard};
 pub use optimization::graph_optimizer::{GraphOptimizer, OptimizationPass, PassResult, OptimizationStats};
 pub use memory::{MemoryAllocator, MemoryBlock, SystemAllocator, ArenaAllocator, PoolAllocator, create_default_allocator};

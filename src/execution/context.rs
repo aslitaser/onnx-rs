@@ -44,6 +44,20 @@ pub struct ExecutionOptions {
     pub enable_operator_fusion: bool,
     /// Enable memory optimization
     pub enable_memory_optimization: bool,
+    /// Enable fine-grained tensor locking (more concurrent operations but higher overhead)
+    pub enable_fine_grained_tensor_locking: bool,
+    /// Cancel all operations if any operation fails
+    pub cancel_on_error: bool,
+    /// Timeout for operations in milliseconds (0 = no timeout)
+    pub operation_timeout_ms: u64,
+    /// Dynamically rebalance work based on execution times
+    pub enable_dynamic_rebalancing: bool,
+    /// Maximum number of operations to run concurrently (0 = no limit)
+    pub max_concurrent_operations: usize,
+    /// Lock acquisition timeout in milliseconds (0 = no timeout)
+    pub lock_timeout_ms: u64,
+    /// Enable advanced scheduling of operations based on critical path
+    pub enable_critical_path_scheduling: bool,
 }
 
 impl Default for ExecutionOptions {
@@ -56,6 +70,13 @@ impl Default for ExecutionOptions {
             workspace_size_bytes: 64 * 1024 * 1024, // 64MB
             enable_operator_fusion: true,
             enable_memory_optimization: true,
+            enable_fine_grained_tensor_locking: false,
+            cancel_on_error: false,
+            operation_timeout_ms: 0, // No timeout
+            enable_dynamic_rebalancing: true,
+            max_concurrent_operations: 0, // No limit
+            lock_timeout_ms: 5000, // 5 second timeout
+            enable_critical_path_scheduling: true,
         }
     }
 }
@@ -105,6 +126,48 @@ impl ExecutionOptions {
     /// Enable or disable memory optimization
     pub fn enable_memory_optimization(mut self, enable: bool) -> Self {
         self.enable_memory_optimization = enable;
+        self
+    }
+    
+    /// Enable or disable fine-grained tensor locking
+    pub fn enable_fine_grained_tensor_locking(mut self, enable: bool) -> Self {
+        self.enable_fine_grained_tensor_locking = enable;
+        self
+    }
+    
+    /// Set behavior for cancellation on error
+    pub fn set_cancel_on_error(mut self, cancel_on_error: bool) -> Self {
+        self.cancel_on_error = cancel_on_error;
+        self
+    }
+    
+    /// Set operation timeout in milliseconds (0 = no timeout)
+    pub fn set_operation_timeout(mut self, timeout_ms: u64) -> Self {
+        self.operation_timeout_ms = timeout_ms;
+        self
+    }
+    
+    /// Enable or disable dynamic rebalancing of work
+    pub fn enable_dynamic_rebalancing(mut self, enable: bool) -> Self {
+        self.enable_dynamic_rebalancing = enable;
+        self
+    }
+    
+    /// Set the maximum number of concurrent operations (0 = no limit)
+    pub fn set_max_concurrent_operations(mut self, max_ops: usize) -> Self {
+        self.max_concurrent_operations = max_ops;
+        self
+    }
+    
+    /// Set lock acquisition timeout in milliseconds (0 = no timeout)
+    pub fn set_lock_timeout(mut self, timeout_ms: u64) -> Self {
+        self.lock_timeout_ms = timeout_ms;
+        self
+    }
+    
+    /// Enable or disable critical path scheduling
+    pub fn enable_critical_path_scheduling(mut self, enable: bool) -> Self {
+        self.enable_critical_path_scheduling = enable;
         self
     }
 }

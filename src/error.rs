@@ -3,13 +3,25 @@ use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Error, Debug)]
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::IoError(err.to_string())
+    }
+}
+
+impl From<prost::DecodeError> for Error {
+    fn from(err: prost::DecodeError) -> Self {
+        Error::ProtobufError(err.to_string())
+    }
+}
+
+#[derive(Error, Debug, Clone)]
 pub enum Error {
     #[error("I/O error: {0}")]
-    IoError(#[from] std::io::Error),
+    IoError(String),
     
     #[error("Protobuf parsing error: {0}")]
-    ProtobufError(#[from] prost::DecodeError),
+    ProtobufError(String),
     
     #[error("Invalid ONNX model: {0}")]
     InvalidModel(String),
@@ -34,4 +46,22 @@ pub enum Error {
     
     #[error("Validation error: {0}")]
     ValidationError(String),
+    
+    #[error("Execution error: {0}")]
+    ExecutionError(String),
+    
+    #[error("Execution was cancelled: {0}")]
+    ExecutionCancelled(String),
+    
+    #[error("Operation timed out: {0}")]
+    OperationTimeout(String),
+    
+    #[error("Lock acquisition failed: {0}")]
+    LockAcquisitionError(String),
+    
+    #[error("Concurrent execution error: {0}")]
+    ConcurrencyError(String),
+    
+    #[error("Resource exhausted: {0}")]
+    ResourceExhausted(String),
 }

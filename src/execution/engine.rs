@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, RwLock, Mutex};
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, HashSet, VecDeque, BinaryHeap};
+use std::cmp::Reverse;
+use std::sync::{Arc, RwLock, Mutex, Condvar, atomic::{AtomicBool, AtomicUsize, Ordering}};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{Error, Result};
 use crate::model::{ExecutionGraph, NodeId, OnnxModel, TensorId};
@@ -853,6 +854,521 @@ fn build_execution_graph(model: &OnnxModel) -> Result<ExecutionGraph> {
     })
 }
 
+/// Execution priorities for nodes in the graph
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExecutionPriority {
+    /// Critical path operations (highest priority)
+    Critical = 0,
+    /// High priority operations
+    High = 1,
+    /// Normal priority operations
+    Normal = 2,
+    /// Low priority operations
+    Low = 3,
+}
+
+impl Default for ExecutionPriority {
+    fn default() -> Self {
+        ExecutionPriority::Normal
+    }
+}
+
+/// Information about an operation to be executed
+#[derive(Debug)]
+struct OperationTask {
+    /// Node ID in the execution graph
+    node_id: NodeId,
+    /// Priority of this operation
+    priority: ExecutionPriority,
+    /// Estimated cost (in arbitrary units, higher means more expensive)
+    estimated_cost: u32,
+    /// Dependencies that must complete before this operation
+    dependencies: Vec<NodeId>,
+    /// Number of remaining dependencies to be satisfied
+    remaining_deps: AtomicUsize,
+    /// Nodes that depend on this operation
+    dependents: Vec<NodeId>,
+    /// Whether execution has started
+    started: AtomicBool,
+    /// Whether execution has completed
+    completed: AtomicBool,
+    /// Whether execution failed
+    failed: AtomicBool,
+    /// Start time of execution
+    start_time: Mutex<Option<Instant>>,
+    /// End time of execution
+    end_time: Mutex<Option<Instant>>,
+    /// Error that occurred during execution, if any
+    error: Mutex<Option<Error>>,
+}
+
+impl OperationTask {
+    fn new(node_id: NodeId, priority: ExecutionPriority, cost: u32) -> Self {
+        Self {
+            node_id,
+            priority,
+            estimated_cost: cost,
+            dependencies: Vec::new(),
+            remaining_deps: AtomicUsize::new(0),
+            dependents: Vec::new(),
+            started: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            start_time: Mutex::new(None),
+            end_time: Mutex::new(None),
+            error: Mutex::new(None),
+        }
+    }
+    
+    fn mark_started(&self) {
+        self.started.store(true, Ordering::Release);
+        let mut start_time = self.start_time.lock().unwrap();
+        *start_time = Some(Instant::now());
+    }
+    
+    fn mark_completed(&self) {
+        self.completed.store(true, Ordering::Release);
+        let mut end_time = self.end_time.lock().unwrap();
+        *end_time = Some(Instant::now());
+    }
+    
+    fn mark_failed(&self, error: Error) {
+        self.failed.store(true, Ordering::Release);
+        let mut end_time = self.end_time.lock().unwrap();
+        *end_time = Some(Instant::now());
+        let mut err = self.error.lock().unwrap();
+        *err = Some(error);
+    }
+    
+    fn is_ready(&self) -> bool {
+        self.remaining_deps.load(Ordering::Acquire) == 0 &&
+        !self.started.load(Ordering::Acquire) &&
+        !self.completed.load(Ordering::Acquire) &&
+        !self.failed.load(Ordering::Acquire)
+    }
+}
+
+/// A task in the execution queue
+#[derive(Debug)]
+struct QueuedTask {
+    /// Task reference
+    task: Arc<OperationTask>,
+    /// Scheduling priority (combines operation priority and other factors)
+    scheduling_priority: i32,
+}
+
+impl PartialEq for QueuedTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.scheduling_priority == other.scheduling_priority
+    }
+}
+
+impl Eq for QueuedTask {}
+
+impl PartialOrd for QueuedTask {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Reverse ordering for min-heap based on priority
+        other.scheduling_priority.partial_cmp(&self.scheduling_priority)
+    }
+}
+
+impl Ord for QueuedTask {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering for min-heap based on priority
+        other.scheduling_priority.cmp(&self.scheduling_priority)
+    }
+}
+
+/// Manages the concurrent execution of operations in the graph
+#[derive(Debug)]
+struct TaskScheduler {
+    /// Tasks by node ID
+    tasks: HashMap<NodeId, Arc<OperationTask>>,
+    /// Ready queue for tasks that can be executed
+    ready_queue: Mutex<BinaryHeap<QueuedTask>>,
+    /// Lock for modifying the task graph
+    graph_lock: Mutex<()>,
+    /// Condition variable for waiting on task completion
+    completion_cv: Condvar,
+    /// Count of tasks in progress
+    tasks_in_progress: AtomicUsize,
+    /// Count of completed tasks
+    completed_tasks: AtomicUsize,
+    /// Count of failed tasks
+    failed_tasks: AtomicUsize,
+    /// Whether execution should be cancelled
+    should_cancel: AtomicBool,
+    /// Whether execution is completed
+    is_completed: AtomicBool,
+    /// Execution options
+    options: Arc<ExecutionOptions>,
+}
+
+impl TaskScheduler {
+    fn new(options: Arc<ExecutionOptions>) -> Self {
+        Self {
+            tasks: HashMap::new(),
+            ready_queue: Mutex::new(BinaryHeap::new()),
+            graph_lock: Mutex::new(()),
+            completion_cv: Condvar::new(),
+            tasks_in_progress: AtomicUsize::new(0),
+            completed_tasks: AtomicUsize::new(0),
+            failed_tasks: AtomicUsize::new(0),
+            should_cancel: AtomicBool::new(false),
+            is_completed: AtomicBool::new(false),
+            options,
+        }
+    }
+    
+    /// Build the task graph from the execution graph
+    fn build_from_graph(&mut self, graph: &ExecutionGraph) -> Result<()> {
+        // Lock to modify the graph
+        let _guard = self.graph_lock.lock().unwrap();
+        
+        // Clear any existing tasks
+        self.tasks.clear();
+        
+        // Create tasks for each node
+        for node in &graph.nodes {
+            // Basic cost estimate (can be refined based on op type)
+            let cost = 10;
+            
+            // Default to normal priority
+            let priority = ExecutionPriority::Normal;
+            
+            // Create the task
+            let task = Arc::new(OperationTask::new(node.id, priority, cost));
+            self.tasks.insert(node.id, task);
+        }
+        
+        // Set up dependencies
+        for (&node_id, deps) in &graph.dependencies {
+            if let Some(task) = self.tasks.get(&node_id) {
+                for &dep_id in deps {
+                    if let Some(dep_task) = self.tasks.get(&dep_id) {
+                        // Add this dependency
+                        task.dependencies.push(dep_id);
+                        // Update the remaining deps counter
+                        task.remaining_deps.fetch_add(1, Ordering::AcqRel);
+                        // Add this task as a dependent of the dependency
+                        dep_task.dependents.push(node_id);
+                    }
+                }
+            }
+        }
+        
+        // Identify critical paths
+        self.identify_critical_paths(graph);
+        
+        // Add all ready tasks to the queue
+        let mut ready_queue = self.ready_queue.lock().unwrap();
+        for task in self.tasks.values() {
+            if task.is_ready() {
+                // Calculate scheduling priority
+                let scheduling_priority = self.calculate_priority(task);
+                
+                ready_queue.push(QueuedTask {
+                    task: task.clone(),
+                    scheduling_priority,
+                });
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Identify critical paths in the graph to prioritize operations
+    fn identify_critical_paths(&mut self, graph: &ExecutionGraph) {
+        // Calculate the earliest time each node can execute
+        let mut earliest_times: HashMap<NodeId, u32> = HashMap::new();
+        
+        // Start with input nodes
+        for &node_id in &graph.input_nodes {
+            earliest_times.insert(node_id, 0);
+        }
+        
+        // Calculate earliest times by traversing forward
+        let mut nodes_in_progress = graph.input_nodes.clone();
+        while !nodes_in_progress.is_empty() {
+            let node_id = nodes_in_progress.remove(0);
+            let task = match self.tasks.get(&node_id) {
+                Some(t) => t,
+                None => continue,
+            };
+            
+            let current_time = *earliest_times.get(&node_id).unwrap_or(&0);
+            let next_time = current_time + task.estimated_cost;
+            
+            // Update dependent nodes
+            for &dep_id in &task.dependents {
+                let existing_time = earliest_times.get(&dep_id).unwrap_or(&0);
+                if next_time > *existing_time {
+                    earliest_times.insert(dep_id, next_time);
+                }
+                
+                nodes_in_progress.push(dep_id);
+            }
+        }
+        
+        // Calculate the latest time each node can execute without delaying the output
+        let mut latest_times: HashMap<NodeId, u32> = HashMap::new();
+        
+        // Find the maximum earliest time to set as the deadline
+        let deadline = earliest_times.values().max().unwrap_or(&0).clone();
+        
+        // Start with output nodes
+        for &node_id in &graph.output_nodes {
+            latest_times.insert(node_id, deadline);
+        }
+        
+        // Calculate latest times by traversing backward
+        let mut nodes_in_progress = graph.output_nodes.clone();
+        while !nodes_in_progress.is_empty() {
+            let node_id = nodes_in_progress.remove(0);
+            let task = match self.tasks.get(&node_id) {
+                Some(t) => t,
+                None => continue,
+            };
+            
+            let current_time = *latest_times.get(&node_id).unwrap_or(&deadline);
+            let prev_time = current_time.saturating_sub(task.estimated_cost);
+            
+            // Update dependent nodes
+            for &dep_id in &task.dependencies {
+                let existing_time = latest_times.get(&dep_id).unwrap_or(&deadline);
+                if prev_time < *existing_time {
+                    latest_times.insert(dep_id, prev_time);
+                }
+                
+                nodes_in_progress.push(dep_id);
+            }
+        }
+        
+        // Calculate slack for each node
+        for (node_id, task) in &mut self.tasks {
+            let earliest = earliest_times.get(node_id).unwrap_or(&0);
+            let latest = latest_times.get(node_id).unwrap_or(&deadline);
+            
+            // Slack is the difference between latest and earliest start times
+            let slack = latest.saturating_sub(*earliest);
+            
+            // Nodes on the critical path have zero slack
+            if slack == 0 {
+                // This is an immutable borrow, so we're updating the priority in a temporary clone
+                let priority = ExecutionPriority::Critical;
+                
+                // Create a new task with the updated priority
+                let mut deps = Vec::new();
+                let mut deps_count = 0;
+                
+                {
+                    let task_ref = task;
+                    deps = task_ref.dependencies.clone();
+                    deps_count = task_ref.remaining_deps.load(Ordering::Acquire);
+                }
+                
+                let new_task = Arc::new(OperationTask {
+                    node_id: *node_id,
+                    priority,
+                    estimated_cost: task.estimated_cost,
+                    dependencies: deps,
+                    remaining_deps: AtomicUsize::new(deps_count),
+                    dependents: task.dependents.clone(),
+                    started: AtomicBool::new(false),
+                    completed: AtomicBool::new(false),
+                    failed: AtomicBool::new(false),
+                    start_time: Mutex::new(None),
+                    end_time: Mutex::new(None),
+                    error: Mutex::new(None),
+                });
+                
+                // Replace the task in the map
+                self.tasks.insert(*node_id, new_task);
+            }
+        }
+    }
+    
+    /// Calculate scheduling priority for a task
+    fn calculate_priority(&self, task: &Arc<OperationTask>) -> i32 {
+        // Base priority from operation priority
+        let mut priority = match task.priority {
+            ExecutionPriority::Critical => 0,
+            ExecutionPriority::High => 100,
+            ExecutionPriority::Normal => 200,
+            ExecutionPriority::Low => 300,
+        };
+        
+        // Add priority based on number of dependents
+        // Operations with more dependents should run first
+        priority -= task.dependents.len() as i32;
+        
+        // Add priority based on estimated cost
+        // More expensive operations should start earlier
+        priority -= (task.estimated_cost as i32) / 10;
+        
+        priority
+    }
+    
+    /// Get the next task to execute
+    fn next_task(&self) -> Option<Arc<OperationTask>> {
+        let mut queue = self.ready_queue.lock().unwrap();
+        if let Some(task) = queue.pop() {
+            Some(task.task)
+        } else {
+            None
+        }
+    }
+    
+    /// Mark a task as started
+    fn mark_task_started(&self, node_id: NodeId) {
+        if let Some(task) = self.tasks.get(&node_id) {
+            task.mark_started();
+            self.tasks_in_progress.fetch_add(1, Ordering::Release);
+        }
+    }
+    
+    /// Mark a task as completed
+    fn mark_task_completed(&self, node_id: NodeId) {
+        if let Some(task) = self.tasks.get(&node_id) {
+            task.mark_completed();
+            self.tasks_in_progress.fetch_sub(1, Ordering::Release);
+            self.completed_tasks.fetch_add(1, Ordering::Release);
+            
+            // Mark dependents as ready if this was their last dependency
+            for &dep_id in &task.dependents {
+                if let Some(dep_task) = self.tasks.get(&dep_id) {
+                    let remaining = dep_task.remaining_deps.fetch_sub(1, Ordering::AcqRel);
+                    
+                    // If this was the last dependency, add to ready queue
+                    if remaining == 1 && !dep_task.started.load(Ordering::Acquire) {
+                        let scheduling_priority = self.calculate_priority(dep_task);
+                        let mut queue = self.ready_queue.lock().unwrap();
+                        
+                        queue.push(QueuedTask {
+                            task: dep_task.clone(),
+                            scheduling_priority,
+                        });
+                    }
+                }
+            }
+            
+            // Notify waiters
+            self.completion_cv.notify_all();
+        }
+    }
+    
+    /// Mark a task as failed
+    fn mark_task_failed(&self, node_id: NodeId, error: Error) {
+        if let Some(task) = self.tasks.get(&node_id) {
+            task.mark_failed(error);
+            self.tasks_in_progress.fetch_sub(1, Ordering::Release);
+            self.failed_tasks.fetch_add(1, Ordering::Release);
+            
+            // Set cancellation flag if configured to cancel on error
+            if self.options.cancel_on_error {
+                self.should_cancel.store(true, Ordering::Release);
+            }
+            
+            // Notify waiters
+            self.completion_cv.notify_all();
+        }
+    }
+    
+    /// Wait for all tasks to complete
+    fn wait_for_completion(&self) -> Result<()> {
+        let mut guard = self.graph_lock.lock().unwrap();
+        
+        while self.tasks_in_progress.load(Ordering::Acquire) > 0 
+               && !self.should_cancel.load(Ordering::Acquire) {
+            // Wait on the condition variable
+            guard = self.completion_cv.wait(guard).unwrap();
+        }
+        
+        // Check if we should cancel
+        if self.should_cancel.load(Ordering::Acquire) {
+            return Err(Error::ExecutionCancelled("Execution was cancelled".to_string()));
+        }
+        
+        // Check if any tasks failed
+        if self.failed_tasks.load(Ordering::Acquire) > 0 {
+            // Find the first error
+            for task in self.tasks.values() {
+                if task.failed.load(Ordering::Acquire) {
+                    let err = task.error.lock().unwrap();
+                    if let Some(error) = &*err {
+                        return Err(error.clone());
+                    }
+                }
+            }
+            
+            // If we don't find a specific error, return a generic one
+            return Err(Error::ExecutionError("One or more operations failed".to_string()));
+        }
+        
+        Ok(())
+    }
+    
+    /// Cancel execution
+    fn cancel(&self) {
+        self.should_cancel.store(true, Ordering::Release);
+        self.completion_cv.notify_all();
+    }
+    
+    /// Get the overall execution progress as a percentage
+    fn get_progress(&self) -> f32 {
+        let total = self.tasks.len();
+        let completed = self.completed_tasks.load(Ordering::Acquire);
+        
+        if total == 0 {
+            return 1.0;
+        }
+        
+        completed as f32 / total as f32
+    }
+    
+    /// Check if execution should be cancelled
+    fn should_cancel(&self) -> bool {
+        self.should_cancel.load(Ordering::Acquire)
+    }
+    
+    /// Reset the scheduler
+    fn reset(&self) {
+        let _guard = self.graph_lock.lock().unwrap();
+        
+        // Reset atomic counters
+        self.tasks_in_progress.store(0, Ordering::Release);
+        self.completed_tasks.store(0, Ordering::Release);
+        self.failed_tasks.store(0, Ordering::Release);
+        self.should_cancel.store(false, Ordering::Release);
+        self.is_completed.store(false, Ordering::Release);
+        
+        // Clear the ready queue
+        let mut queue = self.ready_queue.lock().unwrap();
+        while queue.pop().is_some() {}
+        
+        // Reset all tasks
+        for task in self.tasks.values() {
+            task.started.store(false, Ordering::Release);
+            task.completed.store(false, Ordering::Release);
+            task.failed.store(false, Ordering::Release);
+            
+            // Reset times
+            {
+                let mut start_time = task.start_time.lock().unwrap();
+                *start_time = None;
+            }
+            {
+                let mut end_time = task.end_time.lock().unwrap();
+                *end_time = None;
+            }
+            {
+                let mut err = task.error.lock().unwrap();
+                *err = None;
+            }
+        }
+    }
+}
+
 /// A thread-safe cache for tensors used during execution
 pub struct ThreadSafeTensorCache {
     /// Mapping from tensor IDs to tensors, protected with a RwLock
@@ -955,6 +1471,169 @@ impl ThreadSafeTensorCache {
 }
 
 impl ExecutionEngine {
+    /// Run the model with advanced concurrent execution
+    /// 
+    /// This method provides sophisticated parallel execution using the TaskScheduler:
+    /// - Builds a detailed DAG of operations with dependencies
+    /// - Identifies critical paths to prioritize important operations
+    /// - Uses dynamic priority-based scheduling
+    /// - Provides error handling and cancellation capabilities
+    /// - Supports progress tracking
+    pub fn run_advanced_concurrent(&self, inputs: HashMap<String, Tensor>) -> Result<HashMap<String, Tensor>> {
+        // Ensure the model is prepared
+        let is_prepared = match self.is_prepared.read() {
+            Ok(guard) => *guard,
+            Err(_) => return Err(Error::LockAcquisitionError("Failed to acquire read lock for is_prepared".to_string())),
+        };
+        
+        if !is_prepared {
+            self.prepare()?;
+        }
+        
+        // Set input tensors
+        for (name, tensor) in inputs {
+            self.set_input_tensor(&name, tensor)?;
+        }
+        
+        // Get the execution graph
+        let graph_guard = match self.execution_graph.read() {
+            Ok(guard) => guard,
+            Err(_) => return Err(Error::LockAcquisitionError("Failed to acquire read lock for execution_graph".to_string())),
+        };
+        
+        let graph = match graph_guard.as_ref() {
+            Some(g) => g,
+            None => return Err(Error::InvalidGraph("Execution graph not prepared".to_string())),
+        };
+        
+        // Create task scheduler
+        let mut scheduler = TaskScheduler::new(self.options.clone());
+        
+        // Build task graph
+        scheduler.build_from_graph(graph)?;
+        
+        // Start profiling if enabled
+        let profile_id = if self.options.enable_profiling {
+            Some(self.start_profile_event("model_execution_advanced", None))
+        } else {
+            None
+        };
+        
+        // Execute the graph using the thread pool
+        let pool = match self.context.thread_pool() {
+            Some(p) => p,
+            None => return Err(Error::ConcurrencyError("Thread pool is required for advanced concurrent execution".to_string())),
+        };
+        
+        // Get the maximum number of concurrent operations
+        let max_concurrent = if self.options.max_concurrent_operations > 0 {
+            self.options.max_concurrent_operations
+        } else {
+            // Default to number of threads + 2 to allow for some over-subscription
+            pool.current_num_threads() + 2
+        };
+        
+        // Create a thread-safe shared cancellation flag
+        let should_cancel = Arc::new(AtomicBool::new(false));
+        
+        // Create thread-safe counters
+        let tasks_running = Arc::new(AtomicUsize::new(0));
+        let total_tasks = scheduler.tasks.len();
+        
+        // Execute tasks
+        pool.scope(|s| {
+            // Launch worker threads up to max_concurrent
+            let worker_count = std::cmp::min(max_concurrent, total_tasks);
+            
+            for _ in 0..worker_count {
+                let scheduler_ref = &scheduler;
+                let engine_ref = self;
+                let should_cancel_clone = should_cancel.clone();
+                let tasks_running_clone = tasks_running.clone();
+                
+                s.spawn(move |_| {
+                    // Worker loop - keep getting tasks until none left or cancellation
+                    while !should_cancel_clone.load(Ordering::Acquire) {
+                        // Try to get the next task
+                        let task = match scheduler_ref.next_task() {
+                            Some(t) => t,
+                            None => break, // No more tasks
+                        };
+                        
+                        // Skip if task is already completed or failed
+                        if task.completed.load(Ordering::Acquire) || task.failed.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        
+                        // Mark task as started
+                        scheduler_ref.mark_task_started(task.node_id);
+                        tasks_running_clone.fetch_add(1, Ordering::Release);
+                        
+                        // Execute the task
+                        let result = engine_ref.run_node(task.node_id);
+                        
+                        // Update task status
+                        tasks_running_clone.fetch_sub(1, Ordering::Release);
+                        
+                        match result {
+                            Ok(_) => {
+                                scheduler_ref.mark_task_completed(task.node_id);
+                            }
+                            Err(e) => {
+                                scheduler_ref.mark_task_failed(task.node_id, e);
+                                
+                                // Check if we should cancel execution
+                                if engine_ref.options.cancel_on_error {
+                                    should_cancel_clone.store(true, Ordering::Release);
+                                    scheduler_ref.cancel();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        
+        // Wait for all tasks to complete
+        scheduler.wait_for_completion()?;
+        
+        // End profiling if enabled
+        if let Some(id) = profile_id {
+            self.end_profile_event(id);
+        }
+        
+        // Collect outputs
+        let mut outputs = HashMap::new();
+        
+        // Get a read lock on the tensor name map
+        let tensor_name_map = match self.tensor_name_map.read() {
+            Ok(guard) => guard,
+            Err(_) => return Err(Error::LockAcquisitionError("Failed to acquire read lock for tensor_name_map".to_string())),
+        };
+        
+        for name in self.output_names.iter() {
+            if let Some(tensor_id) = tensor_name_map.get(name) {
+                if let Ok(Some(tensor)) = self.context.get_tensor(tensor_id) {
+                    // Create a named copy of the tensor
+                    let mut output_tensor = tensor.clone();
+                    output_tensor.name = Some(name.clone());
+                    outputs.insert(name.clone(), output_tensor);
+                } else {
+                    return Err(Error::ExecutionError(format!(
+                        "Output tensor '{}' not found in context", name
+                    )));
+                }
+            } else {
+                return Err(Error::ExecutionError(format!(
+                    "Output tensor '{}' not found in tensor map", name
+                )));
+            }
+        }
+        
+        Ok(outputs)
+    }
+
     /// Create a new instance that shares the same model and execution graph
     /// but has its own independent execution context.
     ///
