@@ -1,6 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error::{Error, Result};
 use crate::model::{NodeId, TensorId};
@@ -107,36 +109,113 @@ impl ExecutionOptions {
     }
 }
 
-/// Workspace memory guard
-pub struct WorkspaceGuard<'a> {
-    data: &'a mut [u8],
+/// Thread-safe workspace memory storage
+struct ThreadSafeWorkspace {
+    /// The raw workspace memory
+    data: UnsafeCell<Vec<u8>>,
+    /// Lock for exclusive access to the workspace
+    in_use: AtomicBool,
+    /// Current size in bytes
+    size: AtomicUsize,
 }
 
-impl<'a> WorkspaceGuard<'a> {
+// Manually implement Send and Sync since we're using UnsafeCell
+unsafe impl Send for ThreadSafeWorkspace {}
+unsafe impl Sync for ThreadSafeWorkspace {}
+
+impl ThreadSafeWorkspace {
+    /// Create a new thread-safe workspace
+    fn new(initial_size: usize) -> Self {
+        Self {
+            data: UnsafeCell::new(Vec::with_capacity(initial_size)),
+            in_use: AtomicBool::new(false),
+            size: AtomicUsize::new(0),
+        }
+    }
+    
+    /// Ensure the workspace is at least the specified size
+    fn ensure_size(&self, size_bytes: usize) -> Result<()> {
+        let current_size = self.size.load(Ordering::Acquire);
+        
+        if size_bytes > current_size {
+            // We need to resize
+            let data = unsafe { &mut *self.data.get() };
+            
+            if data.capacity() < size_bytes {
+                data.reserve(size_bytes - data.capacity());
+            }
+            
+            // Update the size
+            data.resize(size_bytes, 0);
+            self.size.store(size_bytes, Ordering::Release);
+        }
+        
+        Ok(())
+    }
+    
+    /// Try to acquire the workspace
+    fn try_acquire(&self) -> bool {
+        !self.in_use.swap(true, Ordering::AcqRel)
+    }
+    
+    /// Release the workspace
+    fn release(&self) {
+        self.in_use.store(false, Ordering::Release);
+    }
+    
+    /// Get a raw pointer to the workspace data
+    fn get_data_ptr(&self) -> *mut u8 {
+        let data = unsafe { &mut *self.data.get() };
+        data.as_mut_ptr()
+    }
+}
+
+/// Workspace memory guard
+pub struct WorkspaceGuard {
+    /// Pointer to the workspace memory
+    ptr: *mut u8,
+    /// Size of the workspace allocation
+    size: usize,
+    /// Reference to the workspace for release
+    workspace: Arc<ThreadSafeWorkspace>,
+}
+
+// Manually implement Send and Sync since we're using raw pointers
+unsafe impl Send for WorkspaceGuard {}
+unsafe impl Sync for WorkspaceGuard {}
+
+impl WorkspaceGuard {
     /// Create a new workspace guard
-    pub(crate) fn new(data: &'a mut [u8]) -> Self {
-        Self { data }
+    fn new(ptr: *mut u8, size: usize, workspace: Arc<ThreadSafeWorkspace>) -> Self {
+        Self { ptr, size, workspace }
     }
     
     /// Get a mutable slice to the workspace
     pub fn data(&mut self) -> &mut [u8] {
-        self.data
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
     }
     
     /// Get size of the workspace
     pub fn size(&self) -> usize {
-        self.data.len()
+        self.size
+    }
+}
+
+impl Drop for WorkspaceGuard {
+    fn drop(&mut self) {
+        // Release the workspace when the guard is dropped
+        self.workspace.release();
     }
 }
 
 /// Execution context for the model
 pub struct ExecutionContext {
-    /// Tensors available during execution
-    tensors: HashMap<TensorId, Tensor>,
-    /// Workspace memory for temporary allocations
-    workspace: Vec<u8>,
-    /// Operator caches for stateful operators
-    operator_caches: HashMap<NodeId, HashMap<String, Box<dyn Any + Send + Sync>>>,
+    /// Tensors available during execution (protected by a RwLock for concurrent read access)
+    tensors: RwLock<HashMap<TensorId, Tensor>>,
+    /// Thread-safe workspace memory for temporary allocations
+    workspace: Arc<ThreadSafeWorkspace>,
+    /// Operator caches for stateful operators (protected by a mutex)
+    operator_caches: Mutex<HashMap<NodeId, HashMap<String, Box<dyn Any + Send + Sync>>>>,
     /// Options for execution
     options: ExecutionOptions,
     /// Thread pool for parallel execution
@@ -156,41 +235,63 @@ impl ExecutionContext {
         };
         
         Self {
-            tensors: HashMap::new(),
-            workspace: Vec::with_capacity(options.workspace_size_bytes),
-            operator_caches: HashMap::new(),
+            tensors: RwLock::new(HashMap::new()),
+            workspace: Arc::new(ThreadSafeWorkspace::new(options.workspace_size_bytes)),
+            operator_caches: Mutex::new(HashMap::new()),
             options,
             thread_pool,
         }
     }
     
-    /// Get a tensor by ID
-    pub fn get_tensor(&self, tensor_id: &TensorId) -> Option<&Tensor> {
-        self.tensors.get(tensor_id)
+    /// Get a tensor by ID (thread-safe read access)
+    pub fn get_tensor(&self, tensor_id: &TensorId) -> Option<Tensor> {
+        if let Ok(tensors) = self.tensors.read() {
+            tensors.get(tensor_id).cloned()
+        } else {
+            None
+        }
     }
     
-    /// Get a mutable tensor by ID
-    pub fn get_tensor_mut(&mut self, tensor_id: &TensorId) -> Option<&mut Tensor> {
-        self.tensors.get_mut(tensor_id)
+    /// Get a mutable tensor by ID (acquires write lock)
+    pub fn get_tensor_for_update(&self, tensor_id: &TensorId) -> Result<Option<Tensor>> {
+        if let Ok(tensors) = self.tensors.read() {
+            Ok(tensors.get(tensor_id).cloned())
+        } else {
+            Err(Error::InvalidModel("Failed to acquire read lock for tensors".to_string()))
+        }
     }
     
-    /// Set a tensor by ID
-    pub fn set_tensor(&mut self, tensor_id: TensorId, tensor: Tensor) {
-        self.tensors.insert(tensor_id, tensor);
+    /// Set a tensor by ID (thread-safe write access)
+    pub fn set_tensor(&self, tensor_id: TensorId, tensor: Tensor) -> Result<()> {
+        if let Ok(mut tensors) = self.tensors.write() {
+            tensors.insert(tensor_id, tensor);
+            Ok(())
+        } else {
+            Err(Error::InvalidModel("Failed to acquire write lock for tensors".to_string()))
+        }
     }
     
-    /// Remove a tensor by ID
-    pub fn remove_tensor(&mut self, tensor_id: &TensorId) -> Option<Tensor> {
-        self.tensors.remove(tensor_id)
+    /// Remove a tensor by ID (thread-safe write access)
+    pub fn remove_tensor(&self, tensor_id: &TensorId) -> Result<Option<Tensor>> {
+        if let Ok(mut tensors) = self.tensors.write() {
+            Ok(tensors.remove(tensor_id))
+        } else {
+            Err(Error::InvalidModel("Failed to acquire write lock for tensors".to_string()))
+        }
     }
     
-    /// Check if a tensor exists
+    /// Check if a tensor exists (thread-safe read access)
     pub fn has_tensor(&self, tensor_id: &TensorId) -> bool {
-        self.tensors.contains_key(tensor_id)
+        if let Ok(tensors) = self.tensors.read() {
+            tensors.contains_key(tensor_id)
+        } else {
+            false
+        }
     }
     
-    /// Get a workspace of the specified size
-    pub fn get_workspace(&mut self, size_bytes: usize) -> Result<WorkspaceGuard> {
+    /// Get a workspace of the specified size (thread-safe)
+    pub fn get_workspace(&self, size_bytes: usize) -> Result<WorkspaceGuard> {
+        // Check workspace size limit
         if size_bytes > self.options.workspace_size_bytes {
             return Err(Error::InvalidModel(format!(
                 "Requested workspace size ({} bytes) exceeds limit ({} bytes)",
@@ -198,17 +299,47 @@ impl ExecutionContext {
             )));
         }
         
-        // Ensure the workspace is large enough
-        if self.workspace.len() < size_bytes {
-            self.workspace.resize(size_bytes, 0);
+        // Try to acquire the workspace
+        if !self.workspace.try_acquire() {
+            return Err(Error::InvalidModel(
+                "Workspace is already in use by another thread".to_string()
+            ));
         }
         
-        Ok(WorkspaceGuard::new(&mut self.workspace[..size_bytes]))
+        // Ensure the workspace is large enough
+        self.workspace.ensure_size(size_bytes)?;
+        
+        // Get a pointer to the workspace memory
+        let ptr = self.workspace.get_data_ptr();
+        
+        // Return a guard with the workspace
+        Ok(WorkspaceGuard::new(ptr, size_bytes, self.workspace.clone()))
     }
     
-    /// Get the operator cache for a node
-    pub fn get_operator_cache(&mut self, node_id: NodeId) -> &mut HashMap<String, Box<dyn Any + Send + Sync>> {
-        self.operator_caches.entry(node_id).or_insert_with(HashMap::new)
+    /// Get the operator cache for a node (thread-safe)
+    pub fn get_operator_cache(&self, node_id: NodeId) -> Result<HashMap<String, Box<dyn Any + Send + Sync>>> {
+        if let Ok(mut caches) = self.operator_caches.lock() {
+            if !caches.contains_key(&node_id) {
+                caches.insert(node_id, HashMap::new());
+            }
+            
+            // Clone the cache for the node
+            Ok(caches.get(&node_id)
+                .expect("Node cache should exist")
+                .clone())
+        } else {
+            Err(Error::InvalidModel("Failed to acquire lock for operator caches".to_string()))
+        }
+    }
+    
+    /// Update the operator cache for a node (thread-safe)
+    pub fn update_operator_cache(&self, node_id: NodeId, cache: HashMap<String, Box<dyn Any + Send + Sync>>) -> Result<()> {
+        if let Ok(mut caches) = self.operator_caches.lock() {
+            caches.insert(node_id, cache);
+            Ok(())
+        } else {
+            Err(Error::InvalidModel("Failed to acquire lock for operator caches".to_string()))
+        }
     }
     
     /// Get execution options
@@ -221,23 +352,41 @@ impl ExecutionContext {
         self.thread_pool.as_ref().map(|tp| tp.as_ref())
     }
     
-    /// Clear all tensors
-    pub fn clear_tensors(&mut self) {
-        self.tensors.clear();
+    /// Clear all tensors (thread-safe)
+    pub fn clear_tensors(&self) -> Result<()> {
+        if let Ok(mut tensors) = self.tensors.write() {
+            tensors.clear();
+            Ok(())
+        } else {
+            Err(Error::InvalidModel("Failed to acquire write lock for tensors".to_string()))
+        }
     }
     
-    /// Clear caches for all operators
-    pub fn clear_operator_caches(&mut self) {
-        self.operator_caches.clear();
+    /// Clear caches for all operators (thread-safe)
+    pub fn clear_operator_caches(&self) -> Result<()> {
+        if let Ok(mut caches) = self.operator_caches.lock() {
+            caches.clear();
+            Ok(())
+        } else {
+            Err(Error::InvalidModel("Failed to acquire lock for operator caches".to_string()))
+        }
     }
     
-    /// Get all tensor IDs
-    pub fn tensor_ids(&self) -> impl Iterator<Item = &TensorId> {
-        self.tensors.keys()
+    /// Get all tensor IDs (thread-safe read access)
+    pub fn tensor_ids(&self) -> Result<Vec<TensorId>> {
+        if let Ok(tensors) = self.tensors.read() {
+            Ok(tensors.keys().cloned().collect())
+        } else {
+            Err(Error::InvalidModel("Failed to acquire read lock for tensors".to_string()))
+        }
     }
     
-    /// Get number of tensors
-    pub fn tensor_count(&self) -> usize {
-        self.tensors.len()
+    /// Get number of tensors (thread-safe read access)
+    pub fn tensor_count(&self) -> Result<usize> {
+        if let Ok(tensors) = self.tensors.read() {
+            Ok(tensors.len())
+        } else {
+            Err(Error::InvalidModel("Failed to acquire read lock for tensors".to_string()))
+        }
     }
 }

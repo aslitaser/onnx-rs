@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::error::{Error, Result};
 use crate::memory::allocator::{MemoryAllocator, MemoryBlock};
@@ -12,7 +13,13 @@ pub struct WorkspaceGuard {
     size: usize,
     /// Reference to the workspace manager for deallocation
     manager: Arc<Mutex<WorkspaceManagerState>>,
+    /// Reference to the parent WorkspaceManager for usage tracking
+    usage_tracker: Option<*const AtomicUsize>,
 }
+
+// Manually implement Send and Sync since we're using raw pointers
+unsafe impl Send for WorkspaceGuard {}
+unsafe impl Sync for WorkspaceGuard {}
 
 impl WorkspaceGuard {
     /// Create a new workspace guard
@@ -21,6 +28,18 @@ impl WorkspaceGuard {
             block: Some(block),
             size,
             manager,
+            usage_tracker: None,
+        }
+    }
+    
+    /// Create a new workspace guard with usage tracking
+    fn new_with_tracking(block: MemoryBlock, size: usize, manager: Arc<Mutex<WorkspaceManagerState>>, 
+                         usage_tracker: *const AtomicUsize) -> Self {
+        Self {
+            block: Some(block),
+            size,
+            manager,
+            usage_tracker: Some(usage_tracker),
         }
     }
 
@@ -69,9 +88,18 @@ impl WorkspaceGuard {
 impl Drop for WorkspaceGuard {
     fn drop(&mut self) {
         if let Some(block) = self.block.take() {
+            // Decrease usage counter atomically if available
+            if let Some(tracker) = self.usage_tracker {
+                unsafe {
+                    // SAFETY: The tracker pointer points to the parent WorkspaceManager's
+                    // current_usage atomic counter which outlives this guard
+                    let counter = &*tracker;
+                    counter.fetch_sub(self.size, Ordering::Relaxed);
+                }
+            }
+            
             // Return the block to the workspace manager
             if let Ok(mut manager) = self.manager.lock() {
-                manager.current_usage -= self.size;
                 manager.free_block(block);
             }
         }
@@ -82,10 +110,6 @@ impl Drop for WorkspaceGuard {
 struct WorkspaceManagerState {
     /// Memory allocator
     allocator: Box<dyn MemoryAllocator>,
-    /// Current workspace usage in bytes
-    current_usage: usize,
-    /// Peak workspace usage in bytes
-    peak_usage: usize,
     /// Primary buffer (if allocated)
     primary_buffer: Option<MemoryBlock>,
     /// Current size of the primary buffer
@@ -99,8 +123,6 @@ impl WorkspaceManagerState {
     fn new(allocator: Box<dyn MemoryAllocator>, initial_size: usize) -> Self {
         Self {
             allocator,
-            current_usage: 0,
-            peak_usage: 0,
             primary_buffer: None,
             primary_buffer_size: initial_size,
             auxiliary_blocks: Vec::new(),
@@ -189,9 +211,6 @@ impl WorkspaceManagerState {
         for block in self.auxiliary_blocks.drain(..) {
             self.allocator.deallocate(block);
         }
-        
-        // Reset usage counters
-        self.current_usage = 0;
     }
 }
 
@@ -199,17 +218,25 @@ impl WorkspaceManagerState {
 pub struct WorkspaceManager {
     /// Internal state
     state: Arc<Mutex<WorkspaceManagerState>>,
+    /// Current memory usage, atomic for thread safety
+    current_usage: AtomicUsize,
+    /// Peak memory usage, atomic for thread safety
+    peak_usage: AtomicUsize,
 }
 
 impl WorkspaceManager {
     /// Create a new workspace manager
     pub fn new(allocator: Box<dyn MemoryAllocator>, initial_size: usize) -> Self {
         let state = Arc::new(Mutex::new(WorkspaceManagerState::new(allocator, initial_size)));
-        Self { state }
+        Self { 
+            state,
+            current_usage: AtomicUsize::new(0),
+            peak_usage: AtomicUsize::new(0),
+        }
     }
 
     /// Get a workspace of the specified size
-    pub fn get_workspace(&mut self, size_bytes: usize) -> Result<WorkspaceGuard> {
+    pub fn get_workspace(&self, size_bytes: usize) -> Result<WorkspaceGuard> {
         // Lock the state
         let mut state = self.state.lock().map_err(|_| {
             Error::InvalidModel("Failed to lock workspace manager state".to_string())
@@ -218,57 +245,71 @@ impl WorkspaceManager {
         // Allocate the workspace
         let block = state.allocate_workspace(size_bytes)?;
 
-        // Update usage statistics
-        state.current_usage += size_bytes;
-        state.peak_usage = std::cmp::max(state.peak_usage, state.current_usage);
+        // Update usage statistics atomically
+        let current = self.current_usage.fetch_add(size_bytes, Ordering::Relaxed) + size_bytes;
+        
+        // Update peak usage if necessary
+        let mut peak = self.peak_usage.load(Ordering::Relaxed);
+        while current > peak {
+            match self.peak_usage.compare_exchange_weak(
+                peak,
+                current,
+                Ordering::SeqCst,
+                Ordering::Relaxed
+            ) {
+                Ok(_) => break,
+                Err(actual) => peak = actual,
+            }
+        }
 
-        // Create and return the guard
-        Ok(WorkspaceGuard::new(block, size_bytes, self.state.clone()))
+        // Create and return the guard with usage tracking
+        Ok(WorkspaceGuard::new_with_tracking(
+            block, 
+            size_bytes, 
+            self.state.clone(),
+            &self.current_usage as *const AtomicUsize
+        ))
     }
 
     /// Reset the workspace manager
-    pub fn reset(&mut self) -> Result<()> {
+    pub fn reset(&self) -> Result<()> {
         let mut state = self.state.lock().map_err(|_| {
             Error::InvalidModel("Failed to lock workspace manager state".to_string())
         })?;
 
         state.reset();
+        
+        // Reset current usage atomically
+        self.current_usage.store(0, Ordering::Relaxed);
+        
         Ok(())
     }
 
     /// Get the current memory usage
-    pub fn current_usage(&self) -> Result<usize> {
-        let state = self.state.lock().map_err(|_| {
-            Error::InvalidModel("Failed to lock workspace manager state".to_string())
-        })?;
-
-        Ok(state.current_usage)
+    pub fn current_usage(&self) -> usize {
+        self.current_usage.load(Ordering::Relaxed)
     }
 
     /// Get the peak memory usage
-    pub fn peak_usage(&self) -> Result<usize> {
-        let state = self.state.lock().map_err(|_| {
-            Error::InvalidModel("Failed to lock workspace manager state".to_string())
-        })?;
-
-        Ok(state.peak_usage)
+    pub fn peak_usage(&self) -> usize {
+        self.peak_usage.load(Ordering::Relaxed)
     }
 }
 
-/// Scoped workspace allocation
+/// Thread-safe scoped workspace allocation
 /// 
 /// This allows for allocating a workspace that is automatically 
 /// deallocated when it goes out of scope, similar to a scoped lock.
-pub struct ScopedWorkspace<'a> {
+pub struct ScopedWorkspace {
     /// The workspace guard
     guard: Option<WorkspaceGuard>,
     /// Reference to the workspace manager
-    manager: &'a mut WorkspaceManager,
+    manager: Arc<WorkspaceManager>,
 }
 
-impl<'a> ScopedWorkspace<'a> {
+impl ScopedWorkspace {
     /// Create a new scoped workspace
-    pub fn new(manager: &'a mut WorkspaceManager, size_bytes: usize) -> Result<Self> {
+    pub fn new(manager: Arc<WorkspaceManager>, size_bytes: usize) -> Result<Self> {
         let guard = manager.get_workspace(size_bytes)?;
         Ok(Self {
             guard: Some(guard),
@@ -314,9 +355,9 @@ impl<'a> ScopedWorkspace<'a> {
     }
 }
 
-impl<'a> Drop for ScopedWorkspace<'a> {
+impl Drop for ScopedWorkspace {
     fn drop(&mut self) {
-        // The guard will be dropped automatically
+        // The guard will be dropped automatically, which will release the workspace
         self.guard = None;
     }
 }

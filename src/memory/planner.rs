@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::cmp;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{Error, Result};
 use crate::model::{ExecutionGraph, NodeId};
@@ -91,9 +92,11 @@ pub struct MemoryPlanner {
     /// Current execution graph being analyzed
     current_graph: Option<Arc<ExecutionGraph>>,
     /// Cache of tensor information
-    tensor_info_cache: HashMap<TensorId, TensorMemoryInfo>,
+    tensor_info_cache: RwLock<HashMap<TensorId, TensorMemoryInfo>>,
     /// Cache of tensor ID mappings
-    tensor_id_map_cache: HashMap<String, TensorId>,
+    tensor_id_map_cache: RwLock<HashMap<String, TensorId>>,
+    /// Atomic counter for generating unique tensor IDs
+    next_tensor_id: AtomicUsize,
 }
 
 impl MemoryPlanner {
@@ -101,9 +104,15 @@ impl MemoryPlanner {
     pub fn new() -> Self {
         Self {
             current_graph: None,
-            tensor_info_cache: HashMap::new(),
-            tensor_id_map_cache: HashMap::new(),
+            tensor_info_cache: RwLock::new(HashMap::new()),
+            tensor_id_map_cache: RwLock::new(HashMap::new()),
+            next_tensor_id: AtomicUsize::new(1), // Start IDs from 1 to reserve 0 for special cases
         }
+    }
+    
+    /// Generate a new unique tensor ID
+    fn generate_tensor_id(&self) -> TensorId {
+        self.next_tensor_id.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Plan memory usage for an execution graph
@@ -115,8 +124,20 @@ impl MemoryPlanner {
         self.current_graph = Some(Arc::new(graph.clone()));
         
         // Clear caches for fresh analysis
-        self.tensor_info_cache.clear();
-        self.tensor_id_map_cache.clear();
+        if let Ok(mut cache) = self.tensor_info_cache.write() {
+            cache.clear();
+        } else {
+            return Err(Error::InvalidModel("Failed to acquire write lock for tensor_info_cache".to_string()));
+        }
+        
+        if let Ok(mut cache) = self.tensor_id_map_cache.write() {
+            cache.clear();
+        } else {
+            return Err(Error::InvalidModel("Failed to acquire write lock for tensor_id_map_cache".to_string()));
+        }
+        
+        // Reset the tensor ID counter
+        self.next_tensor_id.store(1, Ordering::SeqCst);
         
         // Determine execution order
         let execution_order = self.determine_execution_order(graph)?;
@@ -128,7 +149,9 @@ impl MemoryPlanner {
         let tensor_info = self.gather_tensor_info(graph)?;
         
         // Cache the tensor info for later use
-        self.tensor_info_cache = tensor_info.clone();
+        if let Ok(mut cache) = self.tensor_info_cache.write() {
+            *cache = tensor_info.clone();
+        }
 
         // Find in-place operation opportunities
         let inplace_ops = self.inplace_operations_analysis(graph)?;
@@ -274,14 +297,12 @@ impl MemoryPlanner {
     fn gather_tensor_info(&self, graph: &ExecutionGraph) -> Result<HashMap<TensorId, TensorMemoryInfo>> {
         let mut tensor_info = HashMap::new();
         let mut tensor_id_map = HashMap::new();
-        let mut next_id: TensorId = 1; // Start IDs from 1 to reserve 0 for special cases
 
         // Create a mapping from tensor names to unique IDs
         let tensor_names = self.collect_tensor_names(graph);
         for name in tensor_names {
-            let id = next_id;
+            let id = self.generate_tensor_id();
             tensor_id_map.insert(name, id);
-            next_id += 1;
         }
 
         // Process all nodes in the graph
@@ -661,14 +682,24 @@ impl MemoryPlanner {
     /// Create a mapping from tensor names to tensor IDs
     fn create_tensor_id_map(&self, graph: &ExecutionGraph) -> Result<HashMap<String, TensorId>> {
         let mut tensor_id_map = HashMap::new();
-        let mut next_id: TensorId = 1; // Start IDs from 1 to reserve 0 for special cases
+
+        // First, check if we have a cached mapping
+        if let Ok(cache) = self.tensor_id_map_cache.read() {
+            if !cache.is_empty() {
+                return Ok(cache.clone());
+            }
+        }
 
         // Create a mapping from tensor names to unique IDs
         let tensor_names = self.collect_tensor_names(graph);
         for name in tensor_names {
-            let id = next_id;
+            let id = self.generate_tensor_id();
             tensor_id_map.insert(name, id);
-            next_id += 1;
+        }
+        
+        // Update cache
+        if let Ok(mut cache) = self.tensor_id_map_cache.write() {
+            *cache = tensor_id_map.clone();
         }
         
         Ok(tensor_id_map)
@@ -767,8 +798,15 @@ impl MemoryPlanner {
 
         // Create a list of tensors with their sizes
         let mut tensors_with_sizes: Vec<(TensorId, usize, (usize, usize))> = Vec::new();
+        
+        // Thread-safe access to tensor info cache
+        let tensor_info = match self.tensor_info_cache.read() {
+            Ok(cache) => cache,
+            Err(_) => return Err(Error::InvalidModel("Failed to acquire read lock for tensor_info_cache".to_string())),
+        };
+        
         for (&tensor_id, &lifetime) in lifetimes.iter() {
-            if let Some(info) = self.tensor_info_cache.get(&tensor_id) {
+            if let Some(info) = tensor_info.get(&tensor_id) {
                 tensors_with_sizes.push((tensor_id, info.size_bytes, lifetime));
             }
         }
@@ -793,8 +831,8 @@ impl MemoryPlanner {
                 if last1 < first2 || last2 < first1 {
                     // Tensors don't overlap in time, check alignment compatibility
                     if let (Some(info1), Some(info2)) = (
-                        self.tensor_info_cache.get(&id1), 
-                        self.tensor_info_cache.get(&id2)
+                        tensor_info.get(&id1), 
+                        tensor_info.get(&id2)
                     ) {
                         // Check if they have compatible alignment requirements
                         // For simplicity, we'll only share buffers with the same alignment
