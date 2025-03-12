@@ -2,7 +2,7 @@ use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 
 use crate::error::{Error, Result};
 
@@ -379,6 +379,76 @@ impl Drop for ArenaAllocator {
     }
 }
 
+/// A memory block wrapper with reference counting for the pool allocator
+struct PoolBlock {
+    /// The memory block (never changes once created)
+    block: MemoryBlock,
+    /// Reference count (how many allocations are using this block)
+    ref_count: AtomicUsize,
+    /// Whether this block is currently in the pool
+    in_pool: AtomicBool,
+}
+
+impl PoolBlock {
+    /// Create a new pool block
+    fn new(block: MemoryBlock) -> Self {
+        Self {
+            block,
+            ref_count: AtomicUsize::new(0),
+            in_pool: AtomicBool::new(true),
+        }
+    }
+
+    /// Increment the reference count and return whether this was successful
+    /// Returns false if the block is not in the pool
+    fn acquire(&self) -> bool {
+        // First check if the block is in the pool
+        if !self.in_pool.load(Ordering::Acquire) {
+            return false;
+        }
+
+        // Try to increment reference count, starting from 0
+        let result = self.ref_count.compare_exchange(
+            0, 1, 
+            Ordering::AcqRel, 
+            Ordering::Relaxed
+        );
+
+        // If successful, mark as not in pool
+        if result.is_ok() {
+            self.in_pool.store(false, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Increment the reference count (for when a block is shared)
+    fn add_ref(&self) -> usize {
+        self.ref_count.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Decrement the reference count and return the new count
+    fn release(&self) -> usize {
+        let prev = self.ref_count.fetch_sub(1, Ordering::AcqRel);
+        prev - 1
+    }
+
+    /// Return the block to the pool
+    fn return_to_pool(&self) {
+        // Make sure reference count is zero
+        debug_assert_eq!(self.ref_count.load(Ordering::Relaxed), 0);
+        
+        // Mark as in pool
+        self.in_pool.store(true, Ordering::Release);
+    }
+
+    /// Get a reference to the underlying memory block
+    fn get_block(&self) -> MemoryBlock {
+        self.block.clone()
+    }
+}
+
 /// Pool allocator that maintains pools of fixed-size blocks
 pub struct PoolAllocator {
     /// Block size for this pool
@@ -391,10 +461,10 @@ pub struct PoolAllocator {
     capacity: AtomicUsize,
     /// Total allocated memory
     allocated: AtomicUsize,
-    /// Free blocks that can be reused
-    free_blocks: Mutex<Vec<Arc<MemoryBlock>>>,
-    /// Allocated blocks tracked with weak references
-    allocated_blocks: Mutex<HashMap<usize, Arc<MemoryBlock>>>,
+    /// Pool of memory blocks protected by a mutex
+    pool: Arc<Mutex<Vec<Arc<PoolBlock>>>>,
+    /// Map of allocated blocks to their pool blocks
+    block_map: Arc<Mutex<HashMap<usize, Arc<PoolBlock>>>>,
 }
 
 impl PoolAllocator {
@@ -406,14 +476,14 @@ impl PoolAllocator {
             memory_limit,
             capacity: AtomicUsize::new(0),
             allocated: AtomicUsize::new(0),
-            free_blocks: Mutex::new(Vec::new()),
-            allocated_blocks: Mutex::new(HashMap::new()),
+            pool: Arc::new(Mutex::new(Vec::new())),
+            block_map: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Allocate a new block from the system
-    fn allocate_new_block(&self) -> Result<Arc<MemoryBlock>> {
-        // Check memory limit
+    fn allocate_new_block(&self) -> Result<Arc<PoolBlock>> {
+        // Check memory limit with overflow protection
         if let Some(limit) = self.memory_limit {
             let current = self.capacity.load(Ordering::Relaxed);
             let new_capacity = current.checked_add(self.block_size).ok_or_else(|| {
@@ -422,13 +492,13 @@ impl PoolAllocator {
             
             if new_capacity > limit {
                 return Err(Error::InvalidModel(format!(
-                    "Pool allocator memory limit of {} bytes exceeded",
-                    limit
+                    "Pool allocator memory limit of {} bytes exceeded (current: {}, requested: {})",
+                    limit, current, self.block_size
                 )));
             }
         }
 
-        // Create layout
+        // Create layout with overflow protection
         let layout = Layout::from_size_align(self.block_size, self.alignment)
             .map_err(|e| Error::InvalidModel(format!("Invalid pool layout: {}", e)))?;
 
@@ -447,22 +517,25 @@ impl PoolAllocator {
         // Update capacity
         self.capacity.fetch_add(self.block_size, Ordering::Relaxed);
 
-        // Return block wrapped in Arc for shared ownership
-        Ok(Arc::new(MemoryBlock::new(ptr, self.block_size, self.alignment, 0)))
+        // Create and return block wrapped in Arc for shared ownership
+        let memory_block = MemoryBlock::new(ptr, self.block_size, self.alignment, 0);
+        let pool_block = Arc::new(PoolBlock::new(memory_block));
+        
+        Ok(pool_block)
     }
 }
 
 impl MemoryAllocator for PoolAllocator {
     fn allocate(&mut self, size: usize, alignment: usize) -> Result<MemoryBlock> {
-        // Check if requested size fits in our blocks
+        // Check if requested size fits in our blocks with clear error message
         if size > self.block_size {
             return Err(Error::InvalidModel(format!(
-                "Requested allocation size {} exceeds pool block size {}",
+                "Requested allocation size {} bytes exceeds pool block size {} bytes",
                 size, self.block_size
             )));
         }
 
-        // Check if requested alignment is compatible
+        // Check if requested alignment is compatible with clear error message
         if alignment > self.alignment {
             return Err(Error::InvalidModel(format!(
                 "Requested alignment {} exceeds pool alignment {}",
@@ -470,92 +543,158 @@ impl MemoryAllocator for PoolAllocator {
             )));
         }
 
-        // Try to get a block from the free list
-        let mut free_blocks = match self.free_blocks.lock() {
+        // First try to reuse a block from the pool
+        let mut allocated_pool_block: Option<Arc<PoolBlock>> = None;
+        
+        // Acquire pool lock
+        let mut pool_guard = match self.pool.lock() {
             Ok(guard) => guard,
             Err(_) => return Err(Error::InvalidModel(
-                "Failed to lock free blocks mutex".to_string()
+                "Failed to lock pool mutex".to_string()
             )),
         };
         
-        let block = if let Some(block) = free_blocks.pop() {
-            block
-        } else {
+        // Look for an available block in the pool
+        let mut i = 0;
+        while i < pool_guard.len() {
+            let pool_block = &pool_guard[i];
+            
+            // Try to acquire this block
+            if pool_block.acquire() {
+                // Successfully acquired the block
+                allocated_pool_block = Some(pool_block.clone());
+                break;
+            }
+            
+            i += 1;
+        }
+        
+        // If no block was found in the pool, allocate a new one
+        if allocated_pool_block.is_none() {
+            // Release the pool lock before potentially lengthy allocation
+            drop(pool_guard);
+            
             // Allocate a new block
-            drop(free_blocks); // Release the lock before potentially lengthy allocation
-            self.allocate_new_block()?
-        };
-
-        // Update allocation tracking
+            let new_block = self.allocate_new_block()?;
+            
+            // Mark it as acquired
+            new_block.acquire();
+            
+            // Add it to the pool
+            match self.pool.lock() {
+                Ok(mut guard) => {
+                    guard.push(new_block.clone());
+                },
+                Err(_) => {
+                    // If we can't add to the pool, we'll still use the block,
+                    // but it will leak when deallocated since it won't be in the pool
+                    // Log warning in a real implementation
+                }
+            }
+            
+            allocated_pool_block = Some(new_block);
+        }
+        
+        // Get the allocated block
+        let pool_block = allocated_pool_block.unwrap();
+        
+        // Update tracking 
         self.allocated.fetch_add(self.block_size, Ordering::Relaxed);
         
-        // Add to allocated blocks map
-        let mut allocated_blocks = match self.allocated_blocks.lock() {
-            Ok(guard) => guard,
+        // Update block map for deallocation lookup
+        let ptr_key = pool_block.block.ptr().as_ptr() as usize;
+        match self.block_map.lock() {
+            Ok(mut guard) => {
+                guard.insert(ptr_key, pool_block.clone());
+            },
             Err(_) => {
-                // If we can't track it, put it back in the free list to avoid leak
-                if let Ok(mut free_blocks) = self.free_blocks.lock() {
-                    free_blocks.push(block.clone());
+                // If we can't update the map, return an error
+                // This would make deallocate impossible, which would lead to a memory leak
+                pool_block.release(); // Decrement the reference count
+                // If the ref count becomes 0, we should return it to the pool
+                if pool_block.ref_count.load(Ordering::Relaxed) == 0 {
+                    pool_block.return_to_pool();
                 }
                 self.allocated.fetch_sub(self.block_size, Ordering::Relaxed);
                 return Err(Error::InvalidModel(
-                    "Failed to lock allocated blocks mutex".to_string()
+                    "Failed to lock block map mutex".to_string()
                 ));
             }
         };
         
-        allocated_blocks.insert(block.ptr().as_ptr() as usize, block.clone());
+        // Get the memory block to return
+        let memory_block = pool_block.get_block();
         
-        // Return a clone of the block
-        Ok(MemoryBlock {
-            ptr: block.ptr(),
-            size: block.size(),
-            alignment: block.alignment(),
-            offset: block.offset(),
-            _parent: Some(block),
-        })
+        // Set parent reference to ensure the pool block stays alive as long as the memory block
+        Ok(MemoryBlock::new_subblock(
+            memory_block.ptr(),
+            memory_block.size(),
+            memory_block.alignment(),
+            memory_block.offset(),
+            Arc::new(memory_block)
+        ))
     }
 
     fn deallocate(&mut self, block: MemoryBlock) {
-        let ptr = block.ptr().as_ptr() as usize;
+        let ptr_key = block.ptr().as_ptr() as usize;
         
-        // Remove from allocated blocks map
-        let maybe_block = self.allocated_blocks.lock().ok().and_then(|mut map| {
-            map.remove(&ptr)
-        });
+        // Look up the pool block in our map
+        let pool_block = match self.block_map.lock() {
+            Ok(mut guard) => guard.remove(&ptr_key),
+            Err(_) => {
+                // Can't access the map, log error in real implementation
+                // We can't deallocate properly, which might cause a memory leak
+                return;
+            }
+        };
         
-        if let Some(block) = maybe_block {
-            // If we found and removed the block from allocated set
+        if let Some(pool_block) = pool_block {
+            // Update allocation tracking
             self.allocated.fetch_sub(self.block_size, Ordering::Relaxed);
             
-            // Add back to free list if we're the only reference
-            if Arc::strong_count(&block) == 1 {
-                if let Ok(mut free_blocks) = self.free_blocks.lock() {
-                    free_blocks.push(block);
-                }
+            // Release the reference and check if it's the last one
+            let new_count = pool_block.release();
+            
+            // If the reference count is zero, return it to the pool
+            if new_count == 0 {
+                pool_block.return_to_pool();
             }
         }
     }
 
     fn reset(&mut self) {
-        // Move all allocated blocks to free list
-        let allocated_opt = self.allocated_blocks.lock().ok().map(|mut allocated| {
-            std::mem::take(&mut *allocated)
-        });
+        // Acquire locks for both collections
+        let block_map = match self.block_map.lock() {
+            Ok(guard) => guard,
+            Err(_) => return, // Can't reset if we can't lock
+        };
         
-        if let Some(allocated) = allocated_opt {
-            let mut free_opt = self.free_blocks.lock().ok();
-            if let Some(ref mut free) = free_opt {
-                for (_, block) in allocated {
-                    // Only put back in free list if we're the only reference
-                    if Arc::strong_count(&block) == 1 {
-                        free.push(block);
+        // We'll return blocks to the pool only if their ref count is 0
+        // Get all blocks from the map
+        let block_map_arc = self.block_map.clone();
+        let pool_arc = self.pool.clone();
+        
+        // Use a background thread to avoid deadlocks when acquiring multiple locks
+        std::thread::spawn(move || {
+            if let Ok(mut block_map) = block_map_arc.lock() {
+                // Clear the map, moving all blocks out
+                let blocks = std::mem::take(&mut *block_map);
+                
+                // For each block, check ref count and return to pool if zero
+                for (_, block) in blocks {
+                    if block.ref_count.load(Ordering::Relaxed) == 0 {
+                        block.return_to_pool();
+                    } else {
+                        // Re-insert into map if still referenced
+                        let ptr_key = block.block.ptr().as_ptr() as usize;
+                        block_map.insert(ptr_key, block);
                     }
                 }
             }
-            // Reset allocated counter
-            self.allocated.store(0, Ordering::Relaxed);
-        }
+        });
+        
+        // Reset allocation counter (actual count is maintained by reference counts)
+        self.allocated.store(0, Ordering::Relaxed);
     }
 
     fn available_memory(&self) -> usize {
@@ -572,27 +711,60 @@ impl MemoryAllocator for PoolAllocator {
 
 impl Drop for PoolAllocator {
     fn drop(&mut self) {
-        // Take all blocks from free list
-        let mut free_blocks = self.free_blocks.lock().map(|guard| {
-            std::mem::take(&mut *guard)
-        }).unwrap_or_default();
+        // This is a critical section to ensure all memory is properly deallocated
+        // to prevent memory leaks
         
-        // Take all blocks from allocated map
-        let mut allocated_blocks = self.allocated_blocks.lock().map(|guard| {
-            std::mem::take(&mut *guard)
-        }).unwrap_or_default();
+        // First, try to get all blocks from the pool
+        let pool_blocks = match self.pool.lock() {
+            Ok(guard) => {
+                // Take all blocks from the pool
+                std::mem::take(&mut *guard.clone())
+            },
+            Err(_) => {
+                // If we can't lock the pool, we can't clean up properly
+                // In a real implementation, this would be logged as an error
+                Vec::new()
+            }
+        };
         
-        // Add allocated blocks to the free list
-        for (_, block) in allocated_blocks {
-            free_blocks.push(block);
-        }
+        // Next, try to get all blocks from the block map
+        let map_blocks = match self.block_map.lock() {
+            Ok(guard) => {
+                // Take all blocks from the map
+                let mut blocks = Vec::new();
+                for (_, block) in guard.clone().iter() {
+                    blocks.push(block.clone());
+                }
+                blocks
+            },
+            Err(_) => {
+                // If we can't lock the map, we can't clean up properly
+                // In a real implementation, this would be logged as an error
+                Vec::new()
+            }
+        };
+        
+        // Combine all blocks from both collections
+        let mut all_blocks = pool_blocks;
+        all_blocks.extend(map_blocks);
+        
+        // Create a set to deduplicate blocks
+        let mut unique_blocks = std::collections::HashSet::new();
         
         // Deallocate all unique blocks where we have the only reference
-        for block in free_blocks {
-            if Arc::strong_count(&block) == 1 {
-                unsafe {
-                    let layout = Layout::from_size_align_unchecked(self.block_size, self.alignment);
-                    alloc::dealloc(block.ptr().as_ptr(), layout);
+        for block in all_blocks {
+            // Use the pointer as a unique key for deduplication
+            let ptr = block.block.ptr().as_ptr() as usize;
+            
+            // Only process each unique block once
+            if unique_blocks.insert(ptr) {
+                // Check if this is the only strong reference to the block
+                // This is a critical check to avoid double-free errors
+                if Arc::strong_count(&block) == 1 {
+                    unsafe {
+                        let layout = Layout::from_size_align_unchecked(self.block_size, self.alignment);
+                        alloc::dealloc(block.block.ptr().as_ptr(), layout);
+                    }
                 }
             }
         }
