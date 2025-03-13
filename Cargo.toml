@@ -1,0 +1,43 @@
+[package]
+name = "onnx-parser"
+version = "0.1.0"
+edition = "2021"
+description = "ONNX model parser and validator"
+
+[dependencies]
+prost = "0.11"
+prost-derive = "0.11"
+bytes = "1.4"
+thiserror = "1.0"
+petgraph = "0.6"
+log = "0.4"
+ndarray = { version = "0.15", features = ["rayon"] }
+num-traits = "0.2"
+rayon = "1.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+csv = "1.2"
+strum = { version = "0.24", features = ["derive"] }
+strum_macros = "0.24"
+half = "2.2"                    # Support for f16 and bfloat16 types
+num-complex = "0.4"             # Support for complex number operations
+vectorize = "0.2"               # SIMD vectorized operations for faster conversions
+
+[dev-dependencies]
+criterion = { version = "0.4", features = ["html_reports"] }
+tempfile = "3.3"
+anyhow = "1.0"
+rand = "0.8"
+rand_distr = "0.4"
+statistical = "1.0"
+
+[build-dependencies]
+prost-build = "0.11"
+
+[[bench]]
+name = "onnx_benchmarks"
+harness = false
+
+[[bench]]
+name = "comparison_benchmarks"
+harness = false
