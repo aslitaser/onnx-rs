@@ -274,6 +274,9 @@ pub struct MemoryEvent {
     pub address: usize,
     /// Memory pool or allocator identifier
     pub allocator_id: String,
+    /// Additional metadata for the event (tensor shape, data type, etc.)
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 /// Type of memory event
@@ -549,19 +552,23 @@ impl PerformanceStats {
                     // Extract tensor data type from metadata if available
                     if let Some(tensor_id) = event.tensor_id {
                         if let Some(data_type_str) = event.metadata.get("data_type") {
-                            // This is simplified - in a real implementation we would 
-                            // properly parse the DataType enum
-                            let data_type = match data_type_str.as_str() {
-                                "Float32" => DataType::Float32,
-                                "Float64" => DataType::Float64,
-                                "Int32" => DataType::Int32,
-                                "Int64" => DataType::Int64,
-                                _ => DataType::Float32, // Default
-                            };
+                            // Convert string representation to DataType
+                            let data_type = data_type_from_string(data_type_str);
                             
                             if let Some(size_str) = event.metadata.get("size_bytes") {
                                 if let Ok(size) = size_str.parse::<usize>() {
                                     *memory_by_type.entry(data_type).or_insert(0) += size;
+                                    
+                                    // Update memory_by_type with actual tensor size estimation
+                                    if let Some(shape_str) = event.metadata.get("shape") {
+                                        if let Ok(dimensions) = parse_tensor_shape(shape_str) {
+                                            let calculated_size = calculate_tensor_memory_usage(data_type, &dimensions);
+                                            // If the calculated size is significantly different, prefer it
+                                            if calculated_size > size {
+                                                *memory_by_type.entry(data_type).or_insert(0) = calculated_size;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -658,6 +665,8 @@ pub struct Profiler {
     internal_profiler: Arc<crate::tools::profile::Profiler>,
     /// Memory events collected during profiling
     memory_events: Vec<MemoryEvent>,
+    /// Container for shared memory events (for callbacks)
+    memory_events_container: Option<Arc<Mutex<Vec<MemoryEvent>>>>,
     /// Start time of the profiling session
     start_time: Instant,
     /// Whether to track memory usage
@@ -668,6 +677,16 @@ pub struct Profiler {
     generate_flamegraph: bool,
     /// Maximum depth for call stack tracking
     max_stack_depth: usize,
+    /// Peak memory usage in bytes
+    peak_memory_bytes: AtomicUsize,
+    /// Current memory usage in bytes
+    current_memory_bytes: AtomicUsize,
+    /// Memory tracking by data type
+    memory_by_type: Arc<Mutex<HashMap<DataType, usize>>>,
+    /// Memory tracking by tensor
+    memory_by_tensor: Arc<Mutex<HashMap<TensorId, usize>>>,
+    /// Memory tracking by operator
+    memory_by_operator: Arc<Mutex<HashMap<NodeId, usize>>>,
 }
 
 impl Profiler {
@@ -676,11 +695,17 @@ impl Profiler {
         Self {
             internal_profiler: Arc::new(crate::tools::profile::Profiler::new(true)),
             memory_events: Vec::new(),
+            memory_events_container: None,
             start_time: Instant::now(),
             track_memory,
             track_parallelism,
             generate_flamegraph: false,
             max_stack_depth: 32,
+            peak_memory_bytes: AtomicUsize::new(0),
+            current_memory_bytes: AtomicUsize::new(0),
+            memory_by_type: Arc::new(Mutex::new(HashMap::new())),
+            memory_by_tensor: Arc::new(Mutex::new(HashMap::new())),
+            memory_by_operator: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1313,32 +1338,301 @@ impl Profiler {
     
     /// Set up memory tracking in the engine
     fn setup_memory_tracking(&mut self, engine: &mut ExecutionEngine) -> Result<()> {
-        // In a real implementation, this would hook into the memory allocator
-        // Here we'll set up callbacks to track memory events
-        
-        // Example implementation (this would be replaced with actual hooks)
+        // Create a shared container for memory events
         let memory_events = Arc::new(Mutex::new(Vec::new()));
-        let events_clone = Arc::clone(&memory_events);
+        
+        // Create clone for allocation callback
+        let alloc_events_clone = Arc::clone(&memory_events);
+        let start_time = self.start_time;
+        
+        // Get references to our atomic counters and containers for the closure
+        let peak_memory_bytes = Arc::new(AtomicUsize::new(0));
+        let current_memory_bytes = Arc::new(AtomicUsize::new(0));
+        let memory_by_type = Arc::clone(&self.memory_by_type);
+        let memory_by_tensor = Arc::clone(&self.memory_by_tensor);
+        let memory_by_operator = Arc::clone(&self.memory_by_operator);
+        
+        // Clone these values for the closure
+        let peak_memory_ref = Arc::clone(&peak_memory_bytes);
+        let current_memory_ref = Arc::clone(&current_memory_bytes);
+        
+        // Create a weak engine reference to avoid ownership issues
+        let engine_ref = Arc::downgrade(&engine.as_ref().unwrap_or_else(|| engine));
         
         // Register allocation callback
         engine.register_memory_allocation_callback(Box::new(move |size, tensor_id, node_id| {
+            let timestamp = start_time.elapsed().as_micros() as u64;
+            let address = std::ptr::null::<u8>() as usize; // Would be actual address in real impl
+            
+            // Try to get tensor details like shape and data type
+            let mut allocator_id = "default".to_string();
+            let mut event_meta = HashMap::new();
+            
+            if let Some(tid) = tensor_id {
+                if let Some(eng) = engine_ref.upgrade() {
+                    // Try to get tensor information
+                    if let Some(shape) = eng.get_tensor_shape(tid) {
+                        let shape_str = format!("{:?}", shape);
+                        event_meta.insert("shape".to_string(), shape_str);
+                    }
+                    
+                    if let Some(dtype) = eng.get_tensor_data_type(tid) {
+                        let dtype_str = data_type_to_string(dtype);
+                        event_meta.insert("data_type".to_string(), dtype_str);
+                        // Add data type to allocator_id for better tracking
+                        allocator_id = format!("datatype_{}", dtype_str.to_lowercase());
+                    }
+                    
+                    // Try to get tensor name if available
+                    if let Some(name) = eng.get_tensor_name(tid) {
+                        event_meta.insert("name".to_string(), name);
+                    }
+                }
+            }
+            
+            // Add memory size to metadata
+            event_meta.insert("size_bytes".to_string(), size.to_string());
+            
+            // Create the memory event
             let event = MemoryEvent {
                 event_type: MemoryEventType::Allocation,
-                timestamp: Instant::now().elapsed().as_micros() as u64,
+                timestamp,
                 size_bytes: size,
                 tensor_id,
                 node_id,
-                address: 0, // Would be real address in actual implementation
-                allocator_id: "default".to_string(),
+                address,
+                allocator_id,
+                metadata: event_meta,
             };
             
-            if let Ok(mut events) = events_clone.lock() {
+            // Track the event in our shared container
+            if let Ok(mut events) = alloc_events_clone.lock() {
+                events.push(event);
+            }
+            
+            // Update current and peak memory
+            let current = current_memory_ref.fetch_add(size, Ordering::AcqRel) + size;
+            let mut peak = peak_memory_ref.load(Ordering::Acquire);
+            while current > peak {
+                match peak_memory_ref.compare_exchange_weak(
+                    peak,
+                    current,
+                    Ordering::AcqRel,
+                    Ordering::Acquire
+                ) {
+                    Ok(_) => break,
+                    Err(p) => peak = p,
+                }
+            }
+            
+            // Update memory by data type
+            if let Some(tid) = tensor_id {
+                // Get actual data type from tensor or engine
+                let data_type = if let Some(eng) = engine_ref.upgrade() {
+                    if let Some(tensor_data_type) = eng.get_tensor_data_type(tid) {
+                        tensor_data_type
+                    } else {
+                        // If tensor data type can't be determined, check if we have it in metadata
+                        if let Some(meta_type) = eng.get_tensor_metadata(tid, "data_type") {
+                            data_type_from_string(&meta_type)
+                        } else {
+                            DataType::Float32 // Default fallback
+                        }
+                    }
+                } else {
+                    DataType::Float32 // Fallback if engine reference is gone
+                };
+                
+                if let Ok(mut memory_by_type_map) = memory_by_type.lock() {
+                    *memory_by_type_map.entry(data_type).or_insert(0) += size;
+                }
+                
+                // Update memory by tensor
+                if let Ok(mut memory_by_tensor_map) = memory_by_tensor.lock() {
+                    *memory_by_tensor_map.entry(tid).or_insert(0) += size;
+                }
+            }
+            
+            // Update memory by operator
+            if let Some(nid) = node_id {
+                if let Ok(mut memory_by_operator_map) = memory_by_operator.lock() {
+                    *memory_by_operator_map.entry(nid).or_insert(0) += size;
+                }
+            }
+        }))?;
+        
+        // Store the atomic counters for later use
+        self.peak_memory_bytes = peak_memory_bytes;
+        self.current_memory_bytes = current_memory_bytes;
+        
+        // Create clone for deallocation callback
+        let dealloc_events_clone = Arc::clone(&memory_events);
+        let start_time_dealloc = self.start_time;
+        
+        // Clone references for the closure
+        let current_memory_ref = Arc::clone(&self.current_memory_bytes);
+        let memory_by_type = Arc::clone(&self.memory_by_type);
+        let memory_by_tensor = Arc::clone(&self.memory_by_tensor);
+        let memory_by_operator = Arc::clone(&self.memory_by_operator);
+        
+        // Register deallocation callback
+        engine.register_memory_deallocation_callback(Box::new(move |size, tensor_id, node_id| {
+            let timestamp = start_time_dealloc.elapsed().as_micros() as u64;
+            let address = std::ptr::null::<u8>() as usize; // Would be actual address in real impl
+            
+            let mut metadata = HashMap::new();
+            
+            // Add memory size to metadata
+            metadata.insert("size_bytes".to_string(), size.to_string());
+            
+            let event = MemoryEvent {
+                event_type: MemoryEventType::Deallocation,
+                timestamp,
+                size_bytes: size,
+                tensor_id,
+                node_id,
+                address,
+                allocator_id: "default".to_string(),
+                metadata,
+            };
+            
+            // Record the event
+            if let Ok(mut events) = dealloc_events_clone.lock() {
+                events.push(event);
+            }
+            
+            // Update current memory usage
+            current_memory_ref.fetch_sub(size, Ordering::AcqRel);
+            
+            // Note: We don't update peak memory since deallocations don't affect peak
+            
+            // We could track which tensors have been deallocated for memory leak detection
+            if let Some(tid) = tensor_id {
+                // We don't actually remove from memory_by_type or memory_by_tensor
+                // since we want to track total allocations, not current usage
+            }
+        }))?;
+        
+        // Create clone for reuse callback
+        let reuse_events_clone = Arc::clone(&memory_events);
+        let start_time_reuse = self.start_time;
+        
+        // Register memory reuse callback
+        engine.register_memory_reuse_callback(Box::new(move |size, tensor_id, node_id| {
+            let timestamp = start_time_reuse.elapsed().as_micros() as u64;
+            let address = std::ptr::null::<u8>() as usize; // Would be actual address in real impl
+            
+            let mut metadata = HashMap::new();
+            
+            // Add memory size to metadata
+            metadata.insert("size_bytes".to_string(), size.to_string());
+            
+            let event = MemoryEvent {
+                event_type: MemoryEventType::Reuse,
+                timestamp,
+                size_bytes: size,
+                tensor_id,
+                node_id,
+                address,
+                allocator_id: "memory_pool".to_string(),
+                metadata,
+            };
+            
+            if let Ok(mut events) = reuse_events_clone.lock() {
                 events.push(event);
             }
         }))?;
         
-        // This is a simplified example - in a real implementation, we would also
-        // register callbacks for deallocations, reuse, etc.
+        // Create clone for workspace allocation callback
+        let workspace_events_clone = Arc::clone(&memory_events);
+        let start_time_workspace = self.start_time;
+        
+        // Register workspace allocation callback
+        engine.register_workspace_allocation_callback(Box::new(move |size, node_id| {
+            let timestamp = start_time_workspace.elapsed().as_micros() as u64;
+            let address = std::ptr::null::<u8>() as usize; // Would be actual address in real impl
+            
+            let mut metadata = HashMap::new();
+            
+            // Add memory size to metadata
+            metadata.insert("size_bytes".to_string(), size.to_string());
+            
+            // Try to get operator name if node_id is available
+            if let Some(nid) = node_id {
+                if let Some(eng) = engine_ref.upgrade() {
+                    if let Some(op_type) = eng.get_operator_type(nid) {
+                        metadata.insert("op_type".to_string(), op_type);
+                    }
+                }
+            }
+            
+            let event = MemoryEvent {
+                event_type: MemoryEventType::WorkspaceAllocation,
+                timestamp,
+                size_bytes: size,
+                tensor_id: None,
+                node_id,
+                address,
+                allocator_id: "workspace".to_string(),
+                metadata,
+            };
+            
+            if let Ok(mut events) = workspace_events_clone.lock() {
+                events.push(event);
+            }
+        }))?;
+        
+        // Create clone for pool growth callback
+        let pool_events_clone = Arc::clone(&memory_events);
+        let start_time_pool = self.start_time;
+        
+        // Register pool growth callback
+        engine.register_pool_growth_callback(Box::new(move |size, pool_id| {
+            let timestamp = start_time_pool.elapsed().as_micros() as u64;
+            let address = std::ptr::null::<u8>() as usize; // Would be actual address in real impl
+            
+            let mut metadata = HashMap::new();
+            
+            // Add memory size to metadata
+            metadata.insert("size_bytes".to_string(), size.to_string());
+            metadata.insert("pool_id".to_string(), pool_id.to_string());
+            
+            let event = MemoryEvent {
+                event_type: MemoryEventType::PoolGrowth,
+                timestamp,
+                size_bytes: size,
+                tensor_id: None,
+                node_id: None,
+                address,
+                allocator_id: format!("pool_{}", pool_id),
+                metadata,
+            };
+            
+            if let Ok(mut events) = pool_events_clone.lock() {
+                events.push(event);
+            }
+        }))?;
+        
+        // Create a new method to synchronize memory events for analysis
+        let sync_memory_events = move || {
+            if let Ok(events) = memory_events.lock() {
+                // Sort events by timestamp for proper analysis
+                let mut sorted_events = events.clone();
+                sorted_events.sort_by_key(|e| e.timestamp);
+                sorted_events
+            } else {
+                Vec::new()
+            }
+        };
+        
+        // Store the events for later retrieval
+        self.memory_events = sync_memory_events();
+        
+        // Store the memory_events Arc for later updates
+        self.memory_events_container = Some(memory_events);
+        
+        // This would be a good place to analyze the current memory state and provide
+        // initial statistics or alerts on memory patterns
         
         Ok(())
     }
@@ -1517,13 +1811,48 @@ impl Profiler {
     
     /// Calculate memory usage by tensor data type
     fn calculate_memory_by_type(&self) -> HashMap<DataType, usize> {
+        // First try to get the tracked data from our shared mutex
+        if let Ok(memory_by_type) = self.memory_by_type.lock() {
+            return memory_by_type.clone();
+        }
+        
+        // Fallback implementation if the mutex lock fails
         let mut memory_by_type = HashMap::new();
         
         for event in &self.memory_events {
             if event.event_type == MemoryEventType::Allocation {
-                // In a real implementation, we would know the data type from the tensor
-                // For this example, we'll use a placeholder
-                let data_type = DataType::Float32; // Would be obtained from the tensor
+                // Try to determine data type from the tensor_id
+                // In a real implementation, you would query the tensor metadata
+                
+                // We'll use a more sophisticated approach than before:
+                // If tensor_id is available, look for tensor metadata in the events
+                let data_type = if let Some(tensor_id) = event.tensor_id {
+                    // Find metadata for this tensor in the events
+                    self.memory_events.iter()
+                        .filter_map(|e| {
+                            if e.tensor_id == Some(tensor_id) {
+                                // Look for data_type metadata in memory events
+                                if let Some(data_type_str) = e.allocator_id.strip_prefix("datatype_") {
+                                    match data_type_str {
+                                        "float32" => Some(DataType::Float32),
+                                        "float64" => Some(DataType::Float64),
+                                        "int32" => Some(DataType::Int32),
+                                        "int64" => Some(DataType::Int64),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .next()
+                        .unwrap_or(DataType::Float32) // Default to Float32 if not found
+                } else {
+                    // No tensor_id, use default type
+                    DataType::Float32
+                };
                 
                 *memory_by_type.entry(data_type).or_insert(0) += event.size_bytes;
             }
@@ -1534,13 +1863,31 @@ impl Profiler {
     
     /// Calculate memory usage by tensor
     fn calculate_memory_by_tensor(&self) -> HashMap<TensorId, usize> {
+        // First try to get the tracked data from our shared mutex
+        if let Ok(memory_by_tensor) = self.memory_by_tensor.lock() {
+            return memory_by_tensor.clone();
+        }
+        
+        // Fallback implementation if the mutex lock fails
         let mut memory_by_tensor = HashMap::new();
         
+        // Process all memory events to build a comprehensive tensor memory usage map
         for event in &self.memory_events {
-            if event.event_type == MemoryEventType::Allocation {
-                if let Some(tensor_id) = event.tensor_id {
-                    *memory_by_tensor.entry(tensor_id).or_insert(0) += event.size_bytes;
-                }
+            match event.event_type {
+                MemoryEventType::Allocation => {
+                    if let Some(tensor_id) = event.tensor_id {
+                        *memory_by_tensor.entry(tensor_id).or_insert(0) += event.size_bytes;
+                    }
+                },
+                MemoryEventType::Deallocation => {
+                    // We don't subtract here because we want to track total memory allocated per tensor
+                    // But we can mark tensors that have been deallocated for later analysis
+                },
+                MemoryEventType::Reuse => {
+                    // For reused tensors, we want to avoid double-counting
+                    // So we don't add to the total here
+                },
+                _ => {}
             }
         }
         
@@ -1549,13 +1896,46 @@ impl Profiler {
     
     /// Calculate memory usage by operator
     fn calculate_memory_by_operator(&self) -> HashMap<NodeId, usize> {
-        let mut memory_by_operator = HashMap::new();
+        // First try to get the tracked data from our shared mutex
+        if let Ok(memory_by_operator) = self.memory_by_operator.lock() {
+            return memory_by_operator.clone();
+        }
         
+        // Fallback implementation if the mutex lock fails
+        let mut memory_by_operator = HashMap::new();
+        let mut operator_allocated_memory: HashMap<NodeId, HashMap<usize, usize>> = HashMap::new();
+        
+        // Process all memory events to build a comprehensive operator memory usage map
         for event in &self.memory_events {
-            if event.event_type == MemoryEventType::Allocation {
-                if let Some(node_id) = event.node_id {
-                    *memory_by_operator.entry(node_id).or_insert(0) += event.size_bytes;
+            match event.event_type {
+                MemoryEventType::Allocation => {
+                    if let Some(node_id) = event.node_id {
+                        // Track both the total memory and the specific allocations
+                        *memory_by_operator.entry(node_id).or_insert(0) += event.size_bytes;
+                        
+                        // Track this specific allocation by its address
+                        operator_allocated_memory
+                            .entry(node_id)
+                            .or_insert_with(HashMap::new)
+                            .insert(event.address, event.size_bytes);
+                    }
+                },
+                MemoryEventType::Deallocation => {
+                    // We don't subtract from the total because we want to track peak memory usage per operator
+                    // But we can remove the specific allocation from our tracking
+                    if let Some(node_id) = event.node_id {
+                        if let Some(allocations) = operator_allocated_memory.get_mut(&node_id) {
+                            allocations.remove(&event.address);
+                        }
+                    }
+                },
+                MemoryEventType::WorkspaceAllocation => {
+                    // Workspace memory is temporary and tied to specific operators
+                    if let Some(node_id) = event.node_id {
+                        *memory_by_operator.entry(node_id).or_insert(0) += event.size_bytes;
+                    }
                 }
+                _ => {}
             }
         }
         
@@ -1636,26 +2016,74 @@ impl Profiler {
     
     /// Calculate peak memory usage
     fn calculate_peak_memory(&self) -> usize {
+        // First check if we already have the peak memory tracked atomically
+        let peak_memory_atomic = self.peak_memory_bytes.load(Ordering::Acquire);
+        if peak_memory_atomic > 0 {
+            return peak_memory_atomic;
+        }
+        
+        // If not available from atomic counter, calculate from events
         let mut current_memory = 0;
         let mut peak_memory = 0;
         
-        // Sort events by timestamp
+        // Create a HashMap to track allocations by address for accurate tracking
+        let mut active_allocations: HashMap<usize, usize> = HashMap::new();
+        let mut memory_timeline: Vec<(u64, i64)> = Vec::new(); // (timestamp, delta)
+        
+        // Sort events by timestamp for accurate sequential analysis
         let mut events = self.memory_events.clone();
         events.sort_by_key(|e| e.timestamp);
         
-        // Track memory changes over time
+        // Build a memory timeline
         for event in &events {
             match event.event_type {
                 MemoryEventType::Allocation => {
+                    // Track allocation by address to handle deallocation properly
+                    active_allocations.insert(event.address, event.size_bytes);
+                    memory_timeline.push((event.timestamp, event.size_bytes as i64));
+                    
                     current_memory += event.size_bytes;
                     peak_memory = peak_memory.max(current_memory);
                 },
                 MemoryEventType::Deallocation => {
+                    // Only subtract if we have a record of this allocation
+                    if let Some(size) = active_allocations.remove(&event.address) {
+                        memory_timeline.push((event.timestamp, -(size as i64)));
+                        current_memory = current_memory.saturating_sub(size);
+                    } else {
+                        // This can happen if we started profiling after some allocations
+                        memory_timeline.push((event.timestamp, -(event.size_bytes as i64)));
+                        current_memory = current_memory.saturating_sub(event.size_bytes);
+                    }
+                },
+                MemoryEventType::WorkspaceAllocation => {
+                    // Workspace memory is temporary but contributes to peak
+                    memory_timeline.push((event.timestamp, event.size_bytes as i64));
+                    current_memory += event.size_bytes;
+                    peak_memory = peak_memory.max(current_memory);
+                    
+                    // Assume workspace is freed right away for simplicity
+                    // In a real implementation, you'd track workspace deallocation events
+                    memory_timeline.push((event.timestamp + 1, -(event.size_bytes as i64)));
                     current_memory = current_memory.saturating_sub(event.size_bytes);
                 },
-                _ => {}
+                MemoryEventType::Reuse => {
+                    // Memory reuse doesn't affect total usage, but can be tracked for efficiency metrics
+                },
+                MemoryEventType::PoolGrowth => {
+                    // Pool growth represents new memory allocated for the pool
+                    memory_timeline.push((event.timestamp, event.size_bytes as i64));
+                    current_memory += event.size_bytes;
+                    peak_memory = peak_memory.max(current_memory);
+                }
             }
         }
+        
+        // Update the atomic counter with our calculated peak
+        self.peak_memory_bytes.store(peak_memory, Ordering::Release);
+        
+        // Also update current memory for reference
+        self.current_memory_bytes.store(current_memory, Ordering::Release);
         
         peak_memory
     }
@@ -1921,6 +2349,337 @@ pub fn analyze_memory_efficiency(memory_results: &MemoryProfileResults) -> Memor
 /// Suggest optimization opportunities
 pub fn suggest_optimization_opportunities(profile_results: &ProfileResults) -> Vec<OptimizationSuggestion> {
     Profiler::suggest_optimization_opportunities(profile_results)
+}
+
+/// Convert a DataType to its string representation
+pub fn data_type_to_string(data_type: DataType) -> String {
+    match data_type {
+        DataType::Float32 => "Float32".to_string(),
+        DataType::Float64 => "Float64".to_string(),
+        DataType::Int8 => "Int8".to_string(), 
+        DataType::Int16 => "Int16".to_string(),
+        DataType::Int32 => "Int32".to_string(),
+        DataType::Int64 => "Int64".to_string(),
+        DataType::Uint8 => "Uint8".to_string(),
+        DataType::Uint16 => "Uint16".to_string(),
+        DataType::Uint32 => "Uint32".to_string(),
+        DataType::Uint64 => "Uint64".to_string(),
+        DataType::Bool => "Bool".to_string(),
+        DataType::BFloat16 => "BFloat16".to_string(),
+        DataType::Float16 => "Float16".to_string(),
+        DataType::String => "String".to_string(),
+        DataType::Complex64 => "Complex64".to_string(),
+        DataType::Complex128 => "Complex128".to_string(),
+    }
+}
+
+/// Convert a string to a DataType
+pub fn data_type_from_string(type_str: &str) -> DataType {
+    match type_str {
+        "Float32" | "float32" | "FLOAT32" | "float" => DataType::Float32,
+        "Float64" | "float64" | "FLOAT64" | "double" => DataType::Float64,
+        "Int8" | "int8" | "INT8" => DataType::Int8,
+        "Int16" | "int16" | "INT16" => DataType::Int16,
+        "Int32" | "int32" | "INT32" => DataType::Int32,
+        "Int64" | "int64" | "INT64" => DataType::Int64,
+        "Uint8" | "uint8" | "UINT8" => DataType::Uint8,
+        "Uint16" | "uint16" | "UINT16" => DataType::Uint16,
+        "Uint32" | "uint32" | "UINT32" => DataType::Uint32,
+        "Uint64" | "uint64" | "UINT64" => DataType::Uint64,
+        "Bool" | "bool" | "BOOL" | "boolean" => DataType::Bool,
+        "BFloat16" | "bfloat16" | "BFLOAT16" => DataType::BFloat16,
+        "Float16" | "float16" | "FLOAT16" | "half" => DataType::Float16,
+        "String" | "string" | "STRING" => DataType::String,
+        "Complex64" | "complex64" | "COMPLEX64" => DataType::Complex64,
+        "Complex128" | "complex128" | "COMPLEX128" => DataType::Complex128,
+        _ => {
+            // Handle common abbreviations and synonyms
+            if type_str.eq_ignore_ascii_case("f32") { 
+                DataType::Float32 
+            } else if type_str.eq_ignore_ascii_case("f64") {
+                DataType::Float64
+            } else if type_str.eq_ignore_ascii_case("i8") {
+                DataType::Int8
+            } else if type_str.eq_ignore_ascii_case("i16") {
+                DataType::Int16
+            } else if type_str.eq_ignore_ascii_case("i32") {
+                DataType::Int32
+            } else if type_str.eq_ignore_ascii_case("i64") {
+                DataType::Int64
+            } else if type_str.eq_ignore_ascii_case("u8") {
+                DataType::Uint8
+            } else if type_str.eq_ignore_ascii_case("u16") {
+                DataType::Uint16
+            } else if type_str.eq_ignore_ascii_case("u32") {
+                DataType::Uint32
+            } else if type_str.eq_ignore_ascii_case("u64") {
+                DataType::Uint64
+            } else if type_str.eq_ignore_ascii_case("bf16") {
+                DataType::BFloat16
+            } else if type_str.eq_ignore_ascii_case("f16") {
+                DataType::Float16
+            } else {
+                // For unknown types, default to Float32
+                DataType::Float32
+            }
+        }
+    }
+}
+
+/// Calculate memory usage for a tensor based on its data type and dimensions
+/// Returns memory usage in bytes
+pub fn calculate_tensor_memory_usage(data_type: DataType, dimensions: &[usize]) -> usize {
+    // Calculate number of elements
+    let element_count: usize = if dimensions.is_empty() {
+        1 // Scalar
+    } else {
+        dimensions.iter().product()
+    };
+    
+    // Memory per element based on data type
+    let bytes_per_element = match data_type {
+        DataType::Float32 => 4,
+        DataType::Float64 => 8,
+        DataType::Int8 => 1,
+        DataType::Int16 => 2,
+        DataType::Int32 => 4,
+        DataType::Int64 => 8,
+        DataType::Uint8 => 1,
+        DataType::Uint16 => 2,
+        DataType::Uint32 => 4,
+        DataType::Uint64 => 8,
+        DataType::Bool => 1,
+        DataType::BFloat16 => 2,
+        DataType::Float16 => 2,
+        DataType::Complex64 => 8,  // 2 * Float32
+        DataType::Complex128 => 16, // 2 * Float64
+        DataType::String => {
+            // For string tensors, this is approximate as actual size depends on string content
+            // We use 24 bytes as a reasonable estimate for the average string size
+            // (8 bytes for pointer + average 16 bytes per string content)
+            24
+        }
+    };
+    
+    // Calculate total memory usage
+    element_count * bytes_per_element
+}
+
+/// Estimate memory requirements for common ONNX operations
+/// Returns estimated memory usage in bytes
+pub fn estimate_operation_memory(
+    op_type: &str, 
+    input_shapes: &[Vec<usize>], 
+    input_types: &[DataType]
+) -> usize {
+    if input_shapes.is_empty() || input_types.is_empty() {
+        return 0;
+    }
+    
+    match op_type {
+        "Conv" => {
+            // For Conv, we need input, weights, bias (optional), and output
+            // Output size depends on kernel size, padding, etc., but we'll estimate as same size as input
+            if input_shapes.len() >= 2 {
+                let input_memory = calculate_tensor_memory_usage(input_types[0], &input_shapes[0]);
+                let weights_memory = calculate_tensor_memory_usage(input_types[1], &input_shapes[1]);
+                
+                // Bias is optional
+                let bias_memory = if input_shapes.len() > 2 {
+                    calculate_tensor_memory_usage(input_types[2], &input_shapes[2])
+                } else {
+                    0
+                };
+                
+                // Output memory (estimate)
+                let output_memory = input_memory;
+                
+                // Workspace memory for some convolution algorithms
+                let workspace_memory = input_memory * 2;
+                
+                input_memory + weights_memory + bias_memory + output_memory + workspace_memory
+            } else {
+                0
+            }
+        },
+        "MatMul" => {
+            // For MatMul, we have input A, input B, and output C
+            if input_shapes.len() >= 2 {
+                let a_memory = calculate_tensor_memory_usage(input_types[0], &input_shapes[0]);
+                let b_memory = calculate_tensor_memory_usage(input_types[1], &input_shapes[1]);
+                
+                // Estimate output shape (last dim of A × last dim of B)
+                let a_shape = &input_shapes[0];
+                let b_shape = &input_shapes[1];
+                
+                if !a_shape.is_empty() && !b_shape.is_empty() {
+                    let a_rows = a_shape[a_shape.len() - 2];
+                    let b_cols = b_shape[b_shape.len() - 1];
+                    
+                    // Create output shape by taking batch dimensions from A and matrix dims
+                    let mut output_shape = a_shape[..a_shape.len() - 2].to_vec();
+                    output_shape.push(a_rows);
+                    output_shape.push(b_cols);
+                    
+                    let output_memory = calculate_tensor_memory_usage(input_types[0], &output_shape);
+                    a_memory + b_memory + output_memory
+                } else {
+                    a_memory + b_memory
+                }
+            } else {
+                0
+            }
+        },
+        "Reshape" => {
+            // Reshape doesn't allocate much new memory, just the output tensor
+            if !input_shapes.is_empty() {
+                calculate_tensor_memory_usage(input_types[0], &input_shapes[0])
+            } else {
+                0
+            }
+        },
+        "Concat" => {
+            // Concat combines all inputs, so sum up input memory and add output
+            let mut total_memory = 0;
+            for i in 0..input_shapes.len() {
+                total_memory += calculate_tensor_memory_usage(
+                    if i < input_types.len() { input_types[i] } else { input_types[0] },
+                    &input_shapes[i]
+                );
+            }
+            
+            // Output is approximately the sum of inputs
+            total_memory * 2
+        },
+        "Gemm" => {
+            // Similar to MatMul but with alpha, beta parameters
+            if input_shapes.len() >= 2 {
+                let a_memory = calculate_tensor_memory_usage(input_types[0], &input_shapes[0]);
+                let b_memory = calculate_tensor_memory_usage(input_types[1], &input_shapes[1]);
+                
+                // C is optional for Gemm
+                let c_memory = if input_shapes.len() > 2 {
+                    calculate_tensor_memory_usage(
+                        if 2 < input_types.len() { input_types[2] } else { input_types[0] },
+                        &input_shapes[2]
+                    )
+                } else {
+                    0
+                };
+                
+                // Output has shape (A.rows, B.cols)
+                let mut output_shape = Vec::new();
+                if !input_shapes[0].is_empty() && !input_shapes[1].is_empty() {
+                    output_shape.push(input_shapes[0][0]);
+                    output_shape.push(input_shapes[1][1]);
+                    
+                    let output_memory = calculate_tensor_memory_usage(input_types[0], &output_shape);
+                    a_memory + b_memory + c_memory + output_memory
+                } else {
+                    a_memory + b_memory + c_memory
+                }
+            } else {
+                0
+            }
+        },
+        "Pool" | "MaxPool" | "AveragePool" => {
+            // Pooling operations have similar memory patterns to Conv
+            if !input_shapes.is_empty() {
+                let input_memory = calculate_tensor_memory_usage(input_types[0], &input_shapes[0]);
+                
+                // Output is roughly the same size as input for memory estimation
+                input_memory * 2
+            } else {
+                0
+            }
+        },
+        "BatchNormalization" => {
+            // Batch norm has input, scale, bias, mean, variance
+            if input_shapes.len() >= 5 {
+                let input_memory = calculate_tensor_memory_usage(input_types[0], &input_shapes[0]);
+                let scale_memory = calculate_tensor_memory_usage(
+                    if 1 < input_types.len() { input_types[1] } else { input_types[0] },
+                    &input_shapes[1]
+                );
+                let bias_memory = calculate_tensor_memory_usage(
+                    if 2 < input_types.len() { input_types[2] } else { input_types[0] },
+                    &input_shapes[2]
+                );
+                let mean_memory = calculate_tensor_memory_usage(
+                    if 3 < input_types.len() { input_types[3] } else { input_types[0] },
+                    &input_shapes[3]
+                );
+                let var_memory = calculate_tensor_memory_usage(
+                    if 4 < input_types.len() { input_types[4] } else { input_types[0] },
+                    &input_shapes[4]
+                );
+                
+                // Output is same size as input
+                let output_memory = input_memory;
+                
+                input_memory + scale_memory + bias_memory + mean_memory + var_memory + output_memory
+            } else if !input_shapes.is_empty() {
+                // Simplified estimate if we don't have all parameters
+                let input_memory = calculate_tensor_memory_usage(input_types[0], &input_shapes[0]);
+                input_memory * 3 // Input, intermediate calculations, and output
+            } else {
+                0
+            }
+        },
+        // For element-wise operations and activations
+        "Add" | "Sub" | "Mul" | "Div" | "Pow" | 
+        "Relu" | "Sigmoid" | "Tanh" | "LeakyRelu" | "Softmax" => {
+            // These typically have input and same-sized output
+            if !input_shapes.is_empty() {
+                let input_memory = calculate_tensor_memory_usage(input_types[0], &input_shapes[0]);
+                input_memory * 2 // Input + output
+            } else {
+                0
+            }
+        },
+        // Transpose doesn't change memory requirements much
+        "Transpose" => {
+            if !input_shapes.is_empty() {
+                let input_memory = calculate_tensor_memory_usage(input_types[0], &input_shapes[0]);
+                input_memory * 2 // Input + output
+            } else {
+                0
+            }
+        },
+        // For other operations, make a reasonable estimate
+        _ => {
+            // Sum the memory of all inputs
+            let mut total_input_memory = 0;
+            for i in 0..input_shapes.len() {
+                let data_type = if i < input_types.len() { input_types[i] } else { input_types[0] };
+                total_input_memory += calculate_tensor_memory_usage(data_type, &input_shapes[i]);
+            }
+            
+            // Estimate output as roughly same size as all inputs combined
+            total_input_memory * 2
+        }
+    }
+}
+
+/// Parse tensor shape from a string like "[1,3,224,224]" or "(1, 3, 224, 224)"
+fn parse_tensor_shape(shape_str: &str) -> Result<Vec<usize>> {
+    // Remove brackets, parentheses, etc.
+    let clean_str = shape_str
+        .trim()
+        .trim_start_matches(&['[', '(', '{'])
+        .trim_end_matches(&[']', ')', '}']);
+    
+    // Split by commas and parse each dimension
+    let dimensions: Result<Vec<usize>> = clean_str
+        .split(',')
+        .map(|dim| {
+            dim.trim().parse::<usize>().map_err(|e| {
+                Error::ExecutionError(format!("Failed to parse tensor dimension '{}': {}", dim, e))
+            })
+        })
+        .collect();
+    
+    dimensions
 }
 
 /// Export profiling data to various formats
