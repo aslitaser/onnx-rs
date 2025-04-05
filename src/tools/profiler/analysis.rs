@@ -373,9 +373,96 @@ fn calculate_active_memory_usage(mem_results: &MemoryProfileResults) -> usize {
 }
 
 /// Calculate memory fragmentation percentage
-fn calculate_memory_fragmentation(_mem_results: &MemoryProfileResults) -> f64 {
-    // Implementation stub for refactoring exercise
-    0.0
+fn calculate_memory_fragmentation(mem_results: &MemoryProfileResults) -> f64 {
+    // Analyze memory allocation and deallocation events to calculate fragmentation
+    let memory_events = &mem_results.memory_events;
+    
+    // Track active allocations and free blocks
+    let mut active_allocations = HashMap::new();
+    let mut memory_blocks = Vec::new();
+    
+    // Process memory events chronologically
+    let mut sorted_events = memory_events.clone();
+    sorted_events.sort_by_key(|e| e.timestamp);
+    
+    for event in sorted_events {
+        match event.event_type {
+            MemoryEventType::Allocation => {
+                // Record this allocation
+                active_allocations.insert(event.address, (event.size_bytes, event.timestamp));
+                
+                // Add to memory blocks
+                memory_blocks.push((event.address, event.address + event.size_bytes, true));
+            },
+            MemoryEventType::Deallocation => {
+                // Mark block as free
+                if let Some((size, _)) = active_allocations.remove(&event.address) {
+                    // Find and update the block status
+                    if let Some(index) = memory_blocks.iter().position(|&(addr, _, _)| addr == event.address) {
+                        memory_blocks[index] = (event.address, event.address + size, false);
+                    }
+                }
+            },
+            // For other event types, continue
+            _ => continue,
+        }
+    }
+    
+    // Calculate fragmentation metrics
+    let (fragmentation, _) = calculate_memory_fragmentation_metrics(&memory_blocks);
+    
+    fragmentation
+}
+
+/// Calculate memory fragmentation metrics from a list of memory blocks
+fn calculate_memory_fragmentation_metrics(blocks: &[(usize, usize, bool)]) -> (f64, usize) {
+    if blocks.is_empty() {
+        return (0.0, 0);
+    }
+    
+    // Sort blocks by address
+    let mut sorted_blocks = blocks.to_vec();
+    sorted_blocks.sort_by_key(|&(addr, _, _)| addr);
+    
+    // Calculate total memory range and used memory
+    let start_addr = sorted_blocks.first().unwrap().0;
+    let end_addr = sorted_blocks.last().unwrap().1;
+    let memory_range = end_addr - start_addr;
+    
+    // Calculate used memory and free blocks
+    let mut used_memory = 0;
+    let mut free_blocks = 0;
+    let mut prev_end = start_addr;
+    
+    for &(start, end, is_used) in &sorted_blocks {
+        // Count gaps (external fragmentation)
+        if start > prev_end {
+            free_blocks += 1;
+        }
+        
+        // Add used memory
+        if is_used {
+            used_memory += end - start;
+        }
+        
+        prev_end = end;
+    }
+    
+    // Calculate fragmentation percentage
+    // Fragmentation is higher when:
+    // 1. The ratio of used memory to total range is lower
+    // 2. The number of free blocks is higher
+    
+    let memory_utilization = used_memory as f64 / memory_range as f64;
+    let normalized_free_blocks = (free_blocks as f64 / blocks.len() as f64) * 100.0;
+    
+    // Weigh both factors to calculate fragmentation
+    let fragmentation = (1.0 - memory_utilization) * 70.0 + normalized_free_blocks * 30.0;
+    
+    // Clamp to 0-100 range
+    let fragmentation = fragmentation.min(100.0).max(0.0);
+    
+    (fragmentation, free_blocks)
 }
 
 /// Calculate overall memory efficiency score
@@ -386,19 +473,419 @@ fn calculate_efficiency_score(utilization: f64, fragmentation: f64) -> u32 {
     score.min(100.0).max(0.0) as u32
 }
 
-/// Generate memory optimization recommendations
+/// Generate memory optimization recommendations based on profiling results
 fn generate_memory_recommendations(
-    _mem_results: &MemoryProfileResults,
-    _reuse_opportunities: &[TensorReuseOpportunity],
+    mem_results: &MemoryProfileResults,
+    reuse_opportunities: &[TensorReuseOpportunity],
 ) -> Vec<MemoryOptimizationRecommendation> {
-    // Implementation stub for refactoring exercise
-    Vec::new()
+    let mut recommendations = Vec::new();
+    
+    // 1. Process workspace memory usage recommendations
+    analyze_workspace_memory_usage(mem_results, &mut recommendations);
+    
+    // 2. Process tensor reuse opportunities
+    analyze_tensor_reuse_opportunities(reuse_opportunities, &mut recommendations);
+    
+    // 3. Identify in-place operation opportunities
+    identify_inplace_operation_opportunities(mem_results, &mut recommendations);
+    
+    // 4. Identify operations with excessive memory usage
+    identify_excessive_memory_users(mem_results, &mut recommendations);
+    
+    // 5. Check for memory pool optimization opportunities
+    analyze_memory_pool_opportunities(mem_results, &mut recommendations);
+    
+    // Sort recommendations by potential savings
+    recommendations.sort_by(|a, b| b.potential_savings_bytes.cmp(&a.potential_savings_bytes));
+    
+    recommendations
 }
 
-/// Find opportunities for tensor memory reuse
-fn find_tensor_reuse_opportunities(_mem_results: &MemoryProfileResults) -> Vec<TensorReuseOpportunity> {
-    // Implementation stub for refactoring exercise
-    Vec::new()
+/// Analyzes workspace memory usage and generates recommendations
+fn analyze_workspace_memory_usage(
+    mem_results: &MemoryProfileResults,
+    recommendations: &mut Vec<MemoryOptimizationRecommendation>
+) {
+    let workspace_usage = &mem_results.workspace_usage;
+    let peak_bytes = workspace_usage.peak_bytes;
+    
+    // Find operators with excessive workspace usage
+    // Consider an operator excessive if it uses more than 20% of peak workspace memory
+    let excessive_threshold = peak_bytes / 5;
+    
+    // Collect operators exceeding the threshold
+    let mut excessive_operators = Vec::new();
+    for (op_type, usage) in &workspace_usage.usage_per_operator {
+        if *usage >= excessive_threshold {
+            excessive_operators.push((op_type.clone(), *usage));
+        }
+    }
+    
+    // Sort by usage (descending)
+    excessive_operators.sort_by(|a, b| b.1.cmp(&a.1));
+    
+    // Generate recommendations for operators with high workspace usage
+    for (op_type, usage) in excessive_operators {
+        let affected_nodes = find_nodes_by_op_type(mem_results, &op_type);
+        
+        // Find the specific allocation events for this operator
+        let affected_tensors = workspace_usage.allocation_events
+            .iter()
+            .filter(|event| event.op_type == op_type)
+            .filter_map(|event| event.node_id)
+            .collect::<Vec<_>>();
+        
+        // Calculate potential savings (estimate 30-50% reduction with algorithm optimization)
+        let potential_savings = (usage as f64 * 0.3) as usize;
+        
+        if usage >= excessive_threshold {
+            // For convolution operators, suggest workspace algorithm optimizations
+            if op_type.contains("Conv") {
+                recommendations.push(MemoryOptimizationRecommendation {
+                    recommendation_type: MemoryOptimizationType::AlgorithmicOptimization,
+                    description: format!(
+                        "Operator '{}' uses excessive workspace memory ({}MB). Consider using a more memory-efficient convolution algorithm or reducing workspace size.",
+                        op_type, usage / (1024 * 1024)
+                    ),
+                    potential_savings_bytes: potential_savings,
+                    affected_nodes: affected_nodes.clone(),
+                    affected_tensors: affected_tensors.clone(),
+                });
+            } 
+            // For matrix multiplication operators, suggest tiling or blocking
+            else if op_type.contains("Gemm") || op_type.contains("MatMul") {
+                recommendations.push(MemoryOptimizationRecommendation {
+                    recommendation_type: MemoryOptimizationType::AlgorithmicOptimization,
+                    description: format!(
+                        "Operator '{}' uses excessive workspace memory ({}MB). Consider using tiling or blocking techniques to reduce workspace requirements.",
+                        op_type, usage / (1024 * 1024)
+                    ),
+                    potential_savings_bytes: potential_savings,
+                    affected_nodes: affected_nodes.clone(),
+                    affected_tensors: affected_tensors.clone(),
+                });
+            }
+            // For pooling operators, suggest reducing buffer sizes
+            else if op_type.contains("Pool") {
+                recommendations.push(MemoryOptimizationRecommendation {
+                    recommendation_type: MemoryOptimizationType::MemoryManagement,
+                    description: format!(
+                        "Operator '{}' uses excessive workspace memory ({}MB). Consider implementing a line buffer approach to reduce memory requirements.",
+                        op_type, usage / (1024 * 1024)
+                    ),
+                    potential_savings_bytes: potential_savings,
+                    affected_nodes: affected_nodes.clone(),
+                    affected_tensors: affected_tensors.clone(),
+                });
+            }
+            // Generic recommendation for other operators
+            else {
+                recommendations.push(MemoryOptimizationRecommendation {
+                    recommendation_type: MemoryOptimizationType::CustomMemoryPool,
+                    description: format!(
+                        "Operator '{}' uses significant workspace memory ({}MB). Consider customizing workspace allocation strategy for this operator.",
+                        op_type, usage / (1024 * 1024)
+                    ),
+                    potential_savings_bytes: potential_savings,
+                    affected_nodes, 
+                    affected_tensors,
+                });
+            }
+        }
+    }
+    
+    // Check for overall workspace memory patterns
+    let allocation_events = &workspace_usage.allocation_events;
+    
+    // If many short-lived workspace allocations, suggest a custom memory pool
+    if allocation_events.len() > 10 {
+        let short_lived_allocations = allocation_events.iter()
+            .filter(|event| {
+                event.deallocation_time.map_or(false, |dealloc_time| {
+                    dealloc_time - event.allocation_time < 1_000_000_000 // Less than 1 second
+                })
+            })
+            .count();
+        
+        if short_lived_allocations > allocation_events.len() / 2 {
+            recommendations.push(MemoryOptimizationRecommendation {
+                recommendation_type: MemoryOptimizationType::CustomMemoryPool,
+                description: format!(
+                    "Found {} short-lived workspace allocations. Consider implementing a specialized memory pool to reduce allocation overhead.",
+                    short_lived_allocations
+                ),
+                potential_savings_bytes: peak_bytes / 5, // Estimate 20% savings
+                affected_nodes: Vec::new(),
+                affected_tensors: Vec::new(),
+            });
+        }
+    }
+}
+
+/// Analyzes tensor reuse opportunities and generates recommendations
+fn analyze_tensor_reuse_opportunities(
+    reuse_opportunities: &[TensorReuseOpportunity],
+    recommendations: &mut Vec<MemoryOptimizationRecommendation>
+) {
+    // Group similar opportunities to avoid too many recommendations
+    let mut grouped_opportunities = Vec::new();
+    let mut current_group = Vec::new();
+    let mut current_savings = 0;
+    
+    // Only process the top opportunities (limit to first 10)
+    for opportunity in reuse_opportunities.iter().take(10) {
+        if opportunity.confidence > 70 {
+            current_group.push(opportunity);
+            current_savings += opportunity.potential_savings_bytes;
+            
+            // If this group is large enough, add a recommendation
+            if current_group.len() >= 3 || current_savings > 1024 * 1024 {
+                grouped_opportunities.push((current_group.clone(), current_savings));
+                current_group = Vec::new();
+                current_savings = 0;
+            }
+        }
+    }
+    
+    // Add any remaining group
+    if !current_group.is_empty() {
+        grouped_opportunities.push((current_group, current_savings));
+    }
+    
+    // Generate recommendations for each group
+    for (group, savings) in grouped_opportunities {
+        let affected_tensors = group.iter()
+            .flat_map(|opp| vec![opp.tensor1_id, opp.tensor2_id])
+            .collect::<Vec<_>>();
+        
+        recommendations.push(MemoryOptimizationRecommendation {
+            recommendation_type: MemoryOptimizationType::TensorReuse,
+            description: format!(
+                "Found {} tensor reuse opportunities with potential savings of {}MB. Consider implementing memory reuse for these tensors.",
+                group.len(), savings / (1024 * 1024)
+            ),
+            potential_savings_bytes: savings,
+            affected_nodes: Vec::new(),
+            affected_tensors,
+        });
+    }
+}
+
+/// Identifies potential in-place operation opportunities
+fn identify_inplace_operation_opportunities(
+    mem_results: &MemoryProfileResults,
+    recommendations: &mut Vec<MemoryOptimizationRecommendation>
+) {
+    // Look for patterns that can be optimized with in-place operations
+    // For example, operations like ReLU, Sigmoid, or element-wise operations
+    
+    // In-place candidates are operations with matching input and output shapes
+    let inplace_candidates = mem_results.memory_events.iter()
+        .filter(|event| {
+            // In-place candidates typically have specific metadata
+            event.metadata.get("op_type").map_or(false, |op_type| {
+                op_type == "Relu" || op_type == "Sigmoid" || op_type == "Tanh" || 
+                op_type.contains("Add") || op_type.contains("Mul") || op_type.contains("Div")
+            })
+        })
+        .filter_map(|event| event.node_id)
+        .collect::<Vec<_>>();
+    
+    // Group by node ID to avoid duplicates
+    let unique_candidates: Vec<_> = inplace_candidates.into_iter()
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    
+    if !unique_candidates.is_empty() {
+        // Estimate memory savings (pessimistically: 5% of total memory)
+        let potential_savings = mem_results.peak_memory_bytes / 20;
+        
+        recommendations.push(MemoryOptimizationRecommendation {
+            recommendation_type: MemoryOptimizationType::InPlaceOperation,
+            description: format!(
+                "Found {} unary or element-wise operations that could be performed in-place to reduce memory usage.",
+                unique_candidates.len()
+            ),
+            potential_savings_bytes: potential_savings,
+            affected_nodes: unique_candidates,
+            affected_tensors: Vec::new(),
+        });
+    }
+}
+
+/// Identifies operators with excessive memory usage
+fn identify_excessive_memory_users(
+    mem_results: &MemoryProfileResults,
+    recommendations: &mut Vec<MemoryOptimizationRecommendation>
+) {
+    // Find the operators consuming the most memory
+    let mut memory_by_op_type = HashMap::new();
+    
+    // Group memory usage by operator type
+    for (node_id, memory_usage) in &mem_results.memory_by_operator {
+        // Find the operator type for this node ID
+        // This is simplified - in a real implementation you would look up the node type
+        let op_type = mem_results.memory_events.iter()
+            .find(|event| event.node_id == Some(*node_id))
+            .and_then(|event| event.metadata.get("op_type").cloned())
+            .unwrap_or_else(|| "Unknown".to_string());
+        
+        *memory_by_op_type.entry(op_type).or_insert(0) += memory_usage;
+    }
+    
+    // Sort operators by memory usage
+    let mut operators_by_usage: Vec<_> = memory_by_op_type.into_iter().collect();
+    operators_by_usage.sort_by(|a, b| b.1.cmp(&a.1));
+    
+    // Consider the top 3 memory users
+    for (op_type, usage) in operators_by_usage.iter().take(3) {
+        // Only consider if usage is significant (> 10% of peak)
+        if *usage > mem_results.peak_memory_bytes / 10 {
+            let affected_nodes = find_nodes_by_op_type(mem_results, op_type);
+            
+            // Generate operator-specific recommendations
+            if op_type.contains("Conv") {
+                recommendations.push(MemoryOptimizationRecommendation {
+                    recommendation_type: MemoryOptimizationType::PrecisionReduction,
+                    description: format!(
+                        "Operator '{}' consumes significant memory ({}MB). Consider using mixed precision or operator-specific optimizations.",
+                        op_type, usage / (1024 * 1024)
+                    ),
+                    potential_savings_bytes: usage / 2, // Estimate 50% savings
+                    affected_nodes: affected_nodes.clone(),
+                    affected_tensors: Vec::new(),
+                });
+            } else if op_type.contains("MatMul") || op_type.contains("Gemm") {
+                recommendations.push(MemoryOptimizationRecommendation {
+                    recommendation_type: MemoryOptimizationType::OperationFusion,
+                    description: format!(
+                        "Operator '{}' consumes significant memory ({}MB). Consider fusing with adjacent operations.",
+                        op_type, usage / (1024 * 1024)
+                    ),
+                    potential_savings_bytes: usage / 3, // Estimate 33% savings
+                    affected_nodes: affected_nodes.clone(),
+                    affected_tensors: Vec::new(),
+                });
+            } else {
+                recommendations.push(MemoryOptimizationRecommendation {
+                    recommendation_type: MemoryOptimizationType::CustomMemoryPool,
+                    description: format!(
+                        "Operator '{}' consumes significant memory ({}MB). Review allocation patterns and consider optimization.",
+                        op_type, usage / (1024 * 1024)
+                    ),
+                    potential_savings_bytes: usage / 4, // Estimate 25% savings
+                    affected_nodes: affected_nodes.clone(),
+                    affected_tensors: Vec::new(),
+                });
+            }
+        }
+    }
+}
+
+/// Analyzes memory pool opportunities
+fn analyze_memory_pool_opportunities(
+    mem_results: &MemoryProfileResults,
+    recommendations: &mut Vec<MemoryOptimizationRecommendation>
+) {
+    // Count allocations and deallocations to detect inefficient patterns
+    let allocation_count = mem_results.memory_events.iter()
+        .filter(|event| event.event_type == MemoryEventType::Allocation)
+        .count();
+    
+    let deallocation_count = mem_results.memory_events.iter()
+        .filter(|event| event.event_type == MemoryEventType::Deallocation)
+        .count();
+    
+    // If we have many small allocations, suggest a memory pool
+    if allocation_count > 100 && allocation_count == deallocation_count {
+        // Count small allocations (< 4KB)
+        let small_allocation_count = mem_results.memory_events.iter()
+            .filter(|event| {
+                event.event_type == MemoryEventType::Allocation && event.size_bytes < 4 * 1024
+            })
+            .count();
+        
+        if small_allocation_count > allocation_count / 2 {
+            recommendations.push(MemoryOptimizationRecommendation {
+                recommendation_type: MemoryOptimizationType::CustomMemoryPool,
+                description: format!(
+                    "Found {} small memory allocations (< 4KB). Consider implementing a small allocation pool to reduce fragmentation and allocation overhead.",
+                    small_allocation_count
+                ),
+                potential_savings_bytes: mem_results.peak_memory_bytes / 10, // Estimate 10% savings
+                affected_nodes: Vec::new(),
+                affected_tensors: Vec::new(),
+            });
+        }
+    }
+}
+
+/// Helper function to find nodes by operator type
+fn find_nodes_by_op_type(mem_results: &MemoryProfileResults, op_type: &str) -> Vec<NodeId> {
+    mem_results.memory_events.iter()
+        .filter(|event| event.metadata.get("op_type").map_or(false, |t| t == op_type))
+        .filter_map(|event| event.node_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Find opportunities for tensor memory reuse by analyzing tensor lifetimes
+fn find_tensor_reuse_opportunities(mem_results: &MemoryProfileResults) -> Vec<TensorReuseOpportunity> {
+    let mut opportunities = Vec::new();
+    let tensor_lifetimes = &mem_results.tensor_lifetimes;
+    
+    // Create a list of tensor lifetimes for analysis
+    let lifetimes: Vec<_> = tensor_lifetimes.values().collect();
+    
+    // Compare each pair of tensors to check for potential reuse
+    for i in 0..lifetimes.len() {
+        for j in (i+1)..lifetimes.len() {
+            let tensor1 = lifetimes[i];
+            let tensor2 = lifetimes[j];
+            
+            // If tensors have the same data type and similar size, they are candidates for reuse
+            if tensor1.data_type == tensor2.data_type {
+                // Check if lifetimes don't overlap (indicating potential for reuse)
+                let non_overlapping = match (tensor1.deallocation_time, tensor2.allocation_time) {
+                    (Some(t1_dealloc), _) if t1_dealloc <= tensor2.allocation_time => true,
+                    (_, Some(t2_dealloc)) if t2_dealloc <= tensor1.allocation_time => true,
+                    _ => false,
+                };
+                
+                if non_overlapping {
+                    // Calculate similarity in sizes (higher confidence for similar sizes)
+                    let size_ratio = if tensor1.size_bytes >= tensor2.size_bytes {
+                        tensor2.size_bytes as f64 / tensor1.size_bytes as f64
+                    } else {
+                        tensor1.size_bytes as f64 / tensor2.size_bytes as f64
+                    };
+                    
+                    // Only consider reasonably similar sizes (at least 50% similar)
+                    if size_ratio >= 0.5 {
+                        // Calculate potential savings
+                        let savings = tensor1.size_bytes.min(tensor2.size_bytes);
+                        
+                        // Calculate confidence based on size similarity
+                        let confidence = (size_ratio * 100.0) as u32;
+                        
+                        opportunities.push(TensorReuseOpportunity {
+                            tensor1_id: tensor1.tensor_id,
+                            tensor2_id: tensor2.tensor_id,
+                            potential_savings_bytes: savings,
+                            confidence,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    // Sort by potential savings (descending)
+    opportunities.sort_by(|a, b| b.potential_savings_bytes.cmp(&a.potential_savings_bytes));
+    
+    opportunities
 }
 
 /// Compute parallelism statistics from profile events

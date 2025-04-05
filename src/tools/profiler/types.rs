@@ -356,6 +356,10 @@ pub enum MemoryOptimizationType {
     PrecisionReduction,
     /// Custom memory pool
     CustomMemoryPool,
+    /// Algorithmic optimization
+    AlgorithmicOptimization,
+    /// Memory management improvements
+    MemoryManagement,
 }
 
 /// Optimization suggestion

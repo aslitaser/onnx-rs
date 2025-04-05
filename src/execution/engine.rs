@@ -60,6 +60,14 @@ pub struct ExecutionEngine {
     profile_event_counter: Arc<Mutex<usize>>,
     /// Flag indicating if the engine is prepared (protected for thread safety)
     is_prepared: Arc<RwLock<bool>>,
+    /// Callback for memory allocation events
+    memory_allocation_callback: Arc<Mutex<Option<Box<dyn Fn(usize, Option<TensorId>, Option<NodeId>, usize, &str, HashMap<String, String>) + Send + Sync>>>>,
+    /// Callback for memory deallocation events
+    memory_deallocation_callback: Arc<Mutex<Option<Box<dyn Fn(usize, Option<TensorId>, Option<NodeId>, usize, &str, HashMap<String, String>) + Send + Sync>>>>,
+    /// Callback for memory reuse events
+    memory_reuse_callback: Arc<Mutex<Option<Box<dyn Fn(usize, Option<TensorId>, Option<TensorId>, Option<NodeId>, usize, &str) + Send + Sync>>>>,
+    /// Callback for workspace allocation events
+    workspace_allocation_callback: Arc<Mutex<Option<Box<dyn Fn(usize, Option<NodeId>, String) + Send + Sync>>>>,
 }
 
 impl ExecutionEngine {
@@ -90,6 +98,11 @@ impl ExecutionEngine {
             profile_events: Arc::new(Mutex::new(Vec::new())),
             profile_event_counter: Arc::new(Mutex::new(0)),
             is_prepared: Arc::new(RwLock::new(false)),
+            // Initialize callback fields as None
+            memory_allocation_callback: Arc::new(Mutex::new(None)),
+            memory_deallocation_callback: Arc::new(Mutex::new(None)),
+            memory_reuse_callback: Arc::new(Mutex::new(None)),
+            workspace_allocation_callback: Arc::new(Mutex::new(None)),
         })
     }
     
@@ -380,7 +393,87 @@ impl ExecutionEngine {
     /// Allocate workspace memory in a thread-safe manner
     pub fn allocate_workspace(&self, size_bytes: usize) -> Result<WorkspaceGuard> {
         // The context's get_workspace method is already thread-safe
-        self.context.get_workspace(size_bytes)
+        let workspace = self.context.get_workspace(size_bytes)?;
+        
+        // Trigger workspace allocation callback if set
+        if let Ok(callback) = self.workspace_allocation_callback.lock() {
+            if let Some(cb) = callback.as_ref() {
+                // Get the current node ID if available from profiling events
+                let node_id = if self.options.enable_profiling {
+                    let events = self.profile_events.lock().ok()?;
+                    events.last().and_then(|e| e.node_id)
+                } else {
+                    None
+                };
+                
+                // Get the current operation type
+                let op_type = if let Some(node_id) = node_id {
+                    if let Ok(operators) = self.node_operators.read() {
+                        if let Some(graph) = self.execution_graph.read().ok().and_then(|g| g.clone()) {
+                            graph.nodes.iter()
+                                .find(|n| n.id == node_id)
+                                .map(|n| n.op_type.clone())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        } else {
+                            "unknown".to_string()
+                        }
+                    } else {
+                        "unknown".to_string()
+                    }
+                } else {
+                    "unknown".to_string()
+                };
+                
+                // Call the callback
+                cb(size_bytes, node_id, op_type);
+            }
+        }
+        
+        Ok(workspace)
+    }
+    
+    /// Set callback for memory allocation events
+    pub fn set_memory_allocation_callback(
+        &self, 
+        callback: Box<dyn Fn(usize, Option<TensorId>, Option<NodeId>, usize, &str, HashMap<String, String>) + Send + Sync>
+    ) {
+        if let Ok(mut cb) = self.memory_allocation_callback.lock() {
+            *cb = Some(callback);
+        }
+    }
+    
+    /// Set callback for memory deallocation events
+    pub fn set_memory_deallocation_callback(
+        &self, 
+        callback: Box<dyn Fn(usize, Option<TensorId>, Option<NodeId>, usize, &str, HashMap<String, String>) + Send + Sync>
+    ) {
+        if let Ok(mut cb) = self.memory_deallocation_callback.lock() {
+            *cb = Some(callback);
+        }
+    }
+    
+    /// Set callback for memory reuse events
+    pub fn set_memory_reuse_callback(
+        &self, 
+        callback: Box<dyn Fn(usize, Option<TensorId>, Option<TensorId>, Option<NodeId>, usize, &str) + Send + Sync>
+    ) -> Option<Box<dyn Fn(usize, Option<TensorId>, Option<TensorId>, Option<NodeId>, usize, &str) + Send + Sync>> {
+        if let Ok(mut cb) = self.memory_reuse_callback.lock() {
+            let old_callback = cb.take();
+            *cb = Some(callback);
+            old_callback
+        } else {
+            None
+        }
+    }
+    
+    /// Set callback for workspace allocation events
+    pub fn set_workspace_allocation_callback(
+        &self, 
+        callback: Box<dyn Fn(usize, Option<NodeId>, String) + Send + Sync>
+    ) {
+        if let Ok(mut cb) = self.workspace_allocation_callback.lock() {
+            *cb = Some(callback);
+        }
     }
     
     /// Allocate tensors for intermediate outputs in a thread-safe manner
@@ -1661,6 +1754,11 @@ impl ExecutionEngine {
             profile_events: Arc::new(Mutex::new(Vec::new())),
             profile_event_counter: Arc::new(Mutex::new(0)),
             is_prepared: Arc::new(RwLock::new(true)), // Mark as prepared since we verified above
+            // Clone shared callbacks
+            memory_allocation_callback: self.memory_allocation_callback.clone(),
+            memory_deallocation_callback: self.memory_deallocation_callback.clone(),
+            memory_reuse_callback: self.memory_reuse_callback.clone(),
+            workspace_allocation_callback: self.workspace_allocation_callback.clone(),
         };
         
         Ok(cloned)

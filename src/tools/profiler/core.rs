@@ -211,10 +211,174 @@ impl ComprehensiveProfiler {
         }
     }
 
-    /// Setup memory tracking hooks
+    /// Setup memory tracking hooks to intercept memory allocations and deallocations
     fn setup_memory_tracking(&mut self, engine: &mut ExecutionEngine) -> Result<()> {
-        // Implementation would hook into the memory allocator to track allocations
-        // This is a stub for the refactoring exercise
+        // Create a shared container for memory events
+        let memory_events = Arc::new(Mutex::new(Vec::new()));
+        self.memory_events_container = Some(memory_events.clone());
+        
+        // Create weak references to the tracking containers
+        let memory_by_type = Arc::downgrade(&self.memory_by_type);
+        let memory_by_tensor = Arc::downgrade(&self.memory_by_tensor);
+        let memory_by_operator = Arc::downgrade(&self.memory_by_operator);
+        let peak_memory = &self.peak_memory_bytes;
+        let current_memory = &self.current_memory_bytes;
+        let start_time = self.start_time;
+        
+        // Set up allocation tracking
+        engine.set_memory_allocation_callback(Box::new(move |size, tensor_id, node_id, addr, allocator_id, metadata| {
+            // Update current memory usage
+            let current = current_memory.fetch_add(size, Ordering::Relaxed) + size;
+            
+            // Update peak memory if needed
+            let mut peak = peak_memory.load(Ordering::Relaxed);
+            while current > peak {
+                match peak_memory.compare_exchange_weak(
+                    peak, 
+                    current,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => peak = actual,
+                }
+            }
+            
+            // Update memory by data type if available
+            if let Some(data_type) = metadata.get("data_type").and_then(|s| s.parse().ok()) {
+                if let Some(memory_by_type) = memory_by_type.upgrade() {
+                    if let Ok(mut map) = memory_by_type.lock() {
+                        *map.entry(data_type).or_insert(0) += size;
+                    }
+                }
+            }
+            
+            // Update memory by tensor if applicable
+            if let Some(tensor_id) = tensor_id {
+                if let Some(memory_by_tensor) = memory_by_tensor.upgrade() {
+                    if let Ok(mut map) = memory_by_tensor.lock() {
+                        *map.entry(tensor_id).or_insert(0) += size;
+                    }
+                }
+            }
+            
+            // Update memory by operator if applicable
+            if let Some(node_id) = node_id {
+                if let Some(memory_by_operator) = memory_by_operator.upgrade() {
+                    if let Ok(mut map) = memory_by_operator.lock() {
+                        *map.entry(node_id).or_insert(0) += size;
+                    }
+                }
+            }
+            
+            // Record the event
+            let event = MemoryEvent {
+                event_type: if metadata.get("memory_type").map_or(false, |t| t == "workspace") {
+                    MemoryEventType::WorkspaceAllocation
+                } else {
+                    MemoryEventType::Allocation
+                },
+                timestamp: start_time.elapsed().as_nanos() as u64,
+                size_bytes: size,
+                tensor_id,
+                node_id,
+                address: addr,
+                allocator_id: allocator_id.to_string(),
+                metadata: metadata.clone(),
+            };
+            
+            // Add event to the memory events container
+            if let Ok(mut events) = memory_events.lock() {
+                events.push(event);
+            }
+        }));
+        
+        // Set up deallocation tracking
+        engine.set_memory_deallocation_callback(Box::new(move |size, tensor_id, node_id, addr, allocator_id, metadata| {
+            // Update current memory usage
+            let current = current_memory.fetch_sub(size, Ordering::Relaxed) - size;
+            
+            // Record the event
+            let event = MemoryEvent {
+                event_type: if metadata.get("memory_type").map_or(false, |t| t == "workspace") {
+                    MemoryEventType::WorkspaceAllocation // Reuse same type but with metadata indicating deallocation
+                } else {
+                    MemoryEventType::Deallocation
+                },
+                timestamp: start_time.elapsed().as_nanos() as u64,
+                size_bytes: size,
+                tensor_id,
+                node_id,
+                address: addr,
+                allocator_id: allocator_id.to_string(),
+                metadata: {
+                    let mut meta = metadata.clone();
+                    meta.insert("operation".to_string(), "deallocate".to_string());
+                    meta
+                },
+            };
+            
+            // Add event to the memory events container
+            if let Ok(mut events) = memory_events.lock() {
+                events.push(event);
+            }
+        }));
+        
+        // Set up reuse tracking, if supported by the engine
+        if let Some(callback) = engine.set_memory_reuse_callback(Box::new(move |size, old_tensor_id, new_tensor_id, node_id, addr, allocator_id| {
+            // Record the event
+            let event = MemoryEvent {
+                event_type: MemoryEventType::Reuse,
+                timestamp: start_time.elapsed().as_nanos() as u64,
+                size_bytes: size,
+                tensor_id: new_tensor_id,
+                node_id,
+                address: addr,
+                allocator_id: allocator_id.to_string(),
+                metadata: {
+                    let mut meta = HashMap::new();
+                    meta.insert("old_tensor_id".to_string(), format!("{:?}", old_tensor_id));
+                    meta.insert("new_tensor_id".to_string(), format!("{:?}", new_tensor_id));
+                    meta
+                },
+            };
+            
+            // Add event to the memory events container
+            if let Ok(mut events) = memory_events.lock() {
+                events.push(event);
+            }
+        })) {
+            // Store callback if needed
+            drop(callback);
+        }
+        
+        // Hook into workspace allocator events specifically
+        engine.set_workspace_allocation_callback(Box::new(move |size, node_id, op_type| {
+            // Record the event with special workspace metadata
+            let event = MemoryEvent {
+                event_type: MemoryEventType::WorkspaceAllocation,
+                timestamp: start_time.elapsed().as_nanos() as u64,
+                size_bytes: size,
+                tensor_id: None,
+                node_id,
+                address: 0, // We don't track the actual address for workspace allocations
+                allocator_id: "workspace".to_string(),
+                metadata: {
+                    let mut meta = HashMap::new();
+                    meta.insert("memory_type".to_string(), "workspace".to_string());
+                    meta.insert("operation".to_string(), "allocate".to_string());
+                    meta.insert("size_bytes".to_string(), size.to_string());
+                    meta.insert("op_type".to_string(), op_type.clone());
+                    meta
+                },
+            };
+            
+            // Add event to the memory events container
+            if let Ok(mut events) = memory_events.lock() {
+                events.push(event);
+            }
+        }));
+        
         Ok(())
     }
 
@@ -309,17 +473,247 @@ impl ComprehensiveProfiler {
     
     /// Calculate tensor lifetimes from memory events
     fn calculate_tensor_lifetimes(&self) -> HashMap<TensorId, TensorLifetime> {
-        // Stub implementation for refactoring exercise
-        HashMap::new()
+        let mut tensor_lifetimes = HashMap::new();
+        let memory_events = &self.memory_events;
+        
+        // Temporary storage for tracking allocation times and tensor metadata
+        let mut allocation_times = HashMap::new();
+        let mut tensor_metadata = HashMap::new();
+        
+        // First pass: collect all allocation events
+        for event in memory_events {
+            // Skip workspace allocations - they're tracked separately
+            if event.event_type == MemoryEventType::WorkspaceAllocation {
+                continue;
+            }
+            
+            if let Some(tensor_id) = event.tensor_id {
+                match event.event_type {
+                    MemoryEventType::Allocation => {
+                        // Record allocation time
+                        allocation_times.insert(tensor_id, event.timestamp);
+                        
+                        // Store tensor metadata
+                        let data_type = event.metadata.get("data_type")
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(DataType::Float32); // Default if not specified
+                        
+                        let producer_node = event.node_id;
+                        
+                        tensor_metadata.insert(tensor_id, (event.size_bytes, data_type, producer_node));
+                    },
+                    MemoryEventType::Deallocation => {
+                        // If we have an allocation time for this tensor
+                        if let Some(allocation_time) = allocation_times.get(&tensor_id) {
+                            // Get tensor metadata
+                            if let Some((size_bytes, data_type, producer_node)) = tensor_metadata.get(&tensor_id).cloned() {
+                                // Create tensor lifetime entry
+                                let lifetime = TensorLifetime {
+                                    tensor_id,
+                                    allocation_time: *allocation_time,
+                                    deallocation_time: Some(event.timestamp),
+                                    size_bytes,
+                                    data_type,
+                                    producer_node,
+                                    consumer_nodes: Vec::new(), // Will be populated in second pass
+                                };
+                                
+                                tensor_lifetimes.insert(tensor_id, lifetime);
+                            }
+                        }
+                    },
+                    _ => {} // Skip other event types
+                }
+            }
+        }
+        
+        // Second pass: identify tensor consumers
+        for event in memory_events {
+            if event.event_type == ProfileEventType::OpExecution && event.node_id.is_some() {
+                let node_id = event.node_id.unwrap();
+                
+                // Check if this operation used any tensors as inputs
+                for metadata_key in event.metadata.keys() {
+                    if metadata_key.starts_with("input_tensor_") {
+                        if let Some(tensor_id_str) = event.metadata.get(metadata_key) {
+                            if let Ok(tensor_id) = tensor_id_str.parse::<TensorId>() {
+                                // Add this node as a consumer of the tensor
+                                if let Some(lifetime) = tensor_lifetimes.get_mut(&tensor_id) {
+                                    if !lifetime.consumer_nodes.contains(&node_id) {
+                                        lifetime.consumer_nodes.push(node_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Add missing deallocations for tensors that were never explicitly deallocated
+        for (tensor_id, allocation_time) in allocation_times {
+            if !tensor_lifetimes.contains_key(&tensor_id) {
+                if let Some((size_bytes, data_type, producer_node)) = tensor_metadata.get(&tensor_id).cloned() {
+                    // Create tensor lifetime with no deallocation time
+                    let lifetime = TensorLifetime {
+                        tensor_id,
+                        allocation_time,
+                        deallocation_time: None, // No explicit deallocation
+                        size_bytes,
+                        data_type,
+                        producer_node,
+                        consumer_nodes: Vec::new(),
+                    };
+                    
+                    tensor_lifetimes.insert(tensor_id, lifetime);
+                }
+            }
+        }
+        
+        tensor_lifetimes
     }
     
-    /// Calculate workspace memory usage
+    /// Calculate workspace memory usage by analyzing profile events
     fn calculate_workspace_usage(&self, events: &[ProfileEvent]) -> super::types::WorkspaceUsage {
-        // Stub implementation for refactoring exercise
+        // Track workspace allocations and deallocations
+        let mut allocation_events = Vec::new();
+        let mut active_workspaces = HashMap::new();
+        let mut usage_per_operator = HashMap::new();
+        let mut current_bytes = 0;
+        let mut peak_bytes = 0;
+        
+        // Find workspace allocation events in the profile timeline
+        for event in events.iter() {
+            // Look for workspace memory events (they have specific event types or metadata)
+            if event.event_type == ProfileEventType::MemoryAllocation {
+                // Check if this is a workspace allocation by looking at metadata
+                if let Some(mem_type) = event.metadata.get("memory_type") {
+                    if mem_type == "workspace" {
+                        // Extract relevant information
+                        let size_bytes = event.metadata.get("size_bytes")
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(0);
+                        
+                        let op_type = event.name.clone();
+                        let node_id = event.node_id;
+                        
+                        // Track allocation event
+                        let allocation_time = event.start_time
+                            .duration_since(self.start_time)
+                            .as_nanos() as u64;
+                        
+                        // Add to allocation events
+                        let workspace_event = super::types::WorkspaceAllocationEvent {
+                            allocation_time,
+                            deallocation_time: None,
+                            size_bytes,
+                            node_id,
+                            op_type: op_type.clone(),
+                        };
+                        
+                        // Store the workspace allocation with its ID for later deallocation matching
+                        active_workspaces.insert(event.id, (workspace_event, size_bytes));
+                        
+                        // Track usage per operator type
+                        *usage_per_operator.entry(op_type).or_insert(0) += size_bytes;
+                        
+                        // Update current and peak memory usage
+                        current_bytes += size_bytes;
+                        peak_bytes = peak_bytes.max(current_bytes);
+                    }
+                }
+            }
+            // Look for workspace deallocation events
+            else if event.event_type == ProfileEventType::MemoryAllocation && 
+                    event.metadata.get("operation").map_or(false, |op| op == "deallocate") {
+                // Try to find matching allocation event using parent_id
+                if let Some(parent_id) = event.parent_id {
+                    if let Some((mut allocation_event, size)) = active_workspaces.remove(&parent_id) {
+                        // Record deallocation time
+                        let deallocation_time = event.start_time
+                            .duration_since(self.start_time)
+                            .as_nanos() as u64;
+                        
+                        allocation_event.deallocation_time = Some(deallocation_time);
+                        allocation_events.push(allocation_event);
+                        
+                        // Update current bytes
+                        current_bytes = current_bytes.saturating_sub(size);
+                    }
+                }
+            }
+            // Also scan for explicit workspace events if the execution engine emits them
+            else if event.event_type == ProfileEventType::Other && 
+                    event.name.contains("workspace") {
+                if let Some(op_str) = event.metadata.get("operation") {
+                    let size_bytes = event.metadata.get("size_bytes")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    
+                    let op_type = event.metadata.get("op_type")
+                        .unwrap_or(&event.name)
+                        .to_string();
+                    
+                    let allocation_time = event.start_time
+                        .duration_since(self.start_time)
+                        .as_nanos() as u64;
+                    
+                    if op_str == "allocate" {
+                        // Create workspace allocation event
+                        let workspace_event = super::types::WorkspaceAllocationEvent {
+                            allocation_time,
+                            deallocation_time: None,
+                            size_bytes,
+                            node_id: event.node_id,
+                            op_type: op_type.clone(),
+                        };
+                        
+                        // Store for tracking
+                        active_workspaces.insert(event.id, (workspace_event, size_bytes));
+                        
+                        // Track usage per operator type
+                        *usage_per_operator.entry(op_type).or_insert(0) += size_bytes;
+                        
+                        // Update current and peak memory usage
+                        current_bytes += size_bytes;
+                        peak_bytes = peak_bytes.max(current_bytes);
+                    } else if op_str == "deallocate" {
+                        // Try to find the matching allocation
+                        if let Some(parent_id) = event.parent_id {
+                            if let Some((mut allocation_event, size)) = active_workspaces.remove(&parent_id) {
+                                // Record deallocation time
+                                let deallocation_time = event.start_time
+                                    .duration_since(self.start_time)
+                                    .as_nanos() as u64;
+                                
+                                allocation_event.deallocation_time = Some(deallocation_time);
+                                allocation_events.push(allocation_event);
+                                
+                                // Update current bytes
+                                current_bytes = current_bytes.saturating_sub(size);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Any remaining active workspaces should be considered leaked or not yet deallocated
+        // Add them to the allocation events list
+        for (_, (allocation_event, _)) in active_workspaces {
+            allocation_events.push(allocation_event);
+        }
+        
+        // If we didn't find any workspace events but observed peak memory usage,
+        // use the peak memory usage from the workspace manager
+        if peak_bytes == 0 {
+            peak_bytes = self.peak_memory_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        
         super::types::WorkspaceUsage {
-            peak_bytes: 0,
-            allocation_events: Vec::new(),
-            usage_per_operator: HashMap::new(),
+            peak_bytes,
+            allocation_events,
+            usage_per_operator,
         }
     }
     
@@ -419,6 +813,13 @@ impl ComprehensiveProfiler {
         
         // Get profiling events
         let events = self.event_collector.events();
+        
+        // Collect memory events from container if available
+        if let Some(ref container) = self.memory_events_container {
+            if let Ok(events) = container.lock() {
+                self.memory_events = events.clone();
+            }
+        }
         
         // Process memory events
         let memory_by_type = self.calculate_memory_by_type();
